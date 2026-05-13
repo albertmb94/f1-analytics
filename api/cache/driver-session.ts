@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { ensureCachedSessionMeta, getTursoClient } from '../turso';
+import { ensureCachedSessionMeta, getTursoClient } from '../turso.ts';
 
 // GET /api/cache/driver-session?sessionKey=...&driverNumber=...
 //   → { telemetry: TelemetryPoint[], laps: Lap[] } | { telemetry: [], laps: [] }
