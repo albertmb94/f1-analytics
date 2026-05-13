@@ -260,7 +260,8 @@ const PredictiveSimulator: React.FC = () => {
     if (!realIdealRanking || !realCharacteristics || !realTeamLaps || teamsToSimulate.length === 0) return [];
     const simulations = 10000;
     const isRace = activeSessionType === 'R' || activeSessionType === 'S';
-    const topologyFactor = isRace ? 1.0 : 0.3; // Q ideals already encode circuit affinity
+    const hasDataForCircuit = circuit && downloaded.sessions.some(s => s.circuit === circuit.id);
+    const topologyFactor = isRace ? 1.0 : (hasDataForCircuit ? 0.05 : 0.3);
     const modernEra = isModernRegulations(activeSessionYear);
 
     const entries = teamsToSimulate
@@ -314,7 +315,7 @@ const PredictiveSimulator: React.FC = () => {
       // 2026 mode-fit penalty: how well the team's measured X/Z usage matches
       // the track profile. Skipped pre-2026 (no active aero / no mode signal).
       const modePenalty = modernEra && modeShare
-        ? computeModeFitPenalty(modeShare, selectedTrack.profile)
+        ? computeModeFitPenalty(modeShare, selectedTrack.profile) * topologyFactor
         : 0;
       // driverAdjustment only applies to race-style sessions, where both
       // drivers race and the team's expected pace is the lap average. For
