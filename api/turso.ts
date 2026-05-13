@@ -16,7 +16,8 @@ export function getTursoClient(): Client | null {
   return client;
 }
 
-export function ensureCachedSessionMeta(c: Client, meta: {
+// CORRECCIÓN: Función async que retorna la promesa correctamente
+export async function ensureCachedSessionMeta(c: Client, meta: {
   sessionKey: number;
   year: number;
   round: number;
@@ -24,7 +25,7 @@ export function ensureCachedSessionMeta(c: Client, meta: {
   sessionName: string;
   circuitId: string;
 }) {
-  return c.execute({
+  return await c.execute({
     sql: `INSERT OR IGNORE INTO cached_sessions
       (session_key, year, round, session_type, session_name, circuit_id)
       VALUES (?, ?, ?, ?, ?, ?)`,
