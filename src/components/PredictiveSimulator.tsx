@@ -12,12 +12,16 @@ import {
   sampleCenteredLap,
   topologyWeights,
   computeModeFitPenalty,
+  computeCompoundDegradation,
+  simulateRaceStrategies,
   isModernRegulations,
   quantile,
   type TeamMetrics,
   type TeamIdealEntry,
   type SessionTypeLite,
-  type AeroModeShare
+  type AeroModeShare,
+  type TireCompound,
+  type RaceStrategyResult
 } from '../lib/teamMetrics';
 import { filterDatasetByActiveSessions } from '../lib/activeDataset';
 import {
@@ -125,6 +129,14 @@ const PredictiveSimulator: React.FC = () => {
       aeroModeShare.set(team, computeAeroModeShare(merged));
     });
 
+    // Per-team compound degradation slopes (s/lap of tire age, per compound).
+    // Feeds the race-pace strategy forecaster.
+    const compoundDegradationByTeam = new Map<string, Map<TireCompound, number>>();
+    driversByTeam.forEach((teamDrivers, team) => {
+      const allLaps = teamDrivers.flatMap(d => d.laps);
+      compoundDegradationByTeam.set(team, computeCompoundDegradation(allLaps));
+    });
+
     // Track which teams have only some of their expected drivers loaded
     const expectedByTeam = new Map<string, number>();
     downloaded.drivers.forEach(d => {
@@ -136,7 +148,7 @@ const PredictiveSimulator: React.FC = () => {
       if (loaded.length < expected) partial.set(team, { loaded: loaded.length, expected });
     });
 
-    return { characteristics, pace, driverPace, idealRanking, driverIdeal, teamLaps, driverLapCount, aeroModeShare, partial };
+    return { characteristics, pace, driverPace, idealRanking, driverIdeal, teamLaps, driverLapCount, aeroModeShare, compoundDegradationByTeam, partial };
   }, [downloaded.laps, downloaded.telemetry, downloaded.drivers]);
 
   const realTeamPace = realTeamData?.pace ?? null;
@@ -146,6 +158,7 @@ const PredictiveSimulator: React.FC = () => {
   const realTeamLaps = realTeamData?.teamLaps ?? null;
   const realDriverLapCount = realTeamData?.driverLapCount ?? null;
   const realAeroModeShare = realTeamData?.aeroModeShare ?? null;
+  const realCompoundDegradation = realTeamData?.compoundDegradationByTeam ?? null;
   const partialTeams = realTeamData?.partial ?? null;
 
   const circuitOptions = useMemo(() => {
@@ -359,10 +372,68 @@ const PredictiveSimulator: React.FC = () => {
     return results;
   };
 
+  // Race lap count: derive from cached race sessions for this circuit when
+  // possible (max lap number seen), otherwise fall back to 57, the modern
+  // median race length. Hardcoded per-circuit ranges live in the FIA calendar
+  // and were judged not worth a curated table for a first-cut forecaster.
+  const raceLaps = useMemo(() => {
+    if (!circuit) return 57;
+    const raceSessions = downloaded.sessions.filter(s =>
+      s.circuit === circuit.id && (s.sessionType === 'R' || s.sessionType === 'S')
+    );
+    if (raceSessions.length === 0) return 57;
+    let maxLap = 0;
+    Object.entries(downloaded.laps).forEach(([key, laps]) => {
+      const matchesRace = raceSessions.some(s =>
+        key.endsWith(`_${s.year}_${s.round}_${s.sessionType}`)
+      );
+      if (!matchesRace) return;
+      laps.forEach(l => { if (l.number > maxLap) maxLap = l.number; });
+    });
+    return maxLap > 0 ? maxLap : 57;
+  }, [circuit, downloaded.sessions, downloaded.laps]);
+
+  // Race strategy forecast — runs alongside the qualifying-style Monte Carlo
+  // and shows the best 1-stop / 2-stop plan per team for the selected
+  // circuit, plus the gap to the fastest projected team. First cut: no SC /
+  // VSC modelling, no track position effects, no per-team compound offsets.
+  const [raceStrategyResults, setRaceStrategyResults] = useState<Array<{
+    team: string;
+    bestStrategy: RaceStrategyResult;
+    allStrategies: RaceStrategyResult[];
+    gapToLeader: number;
+  }>>([]);
+
+  const computeRaceStrategy = (): typeof raceStrategyResults => {
+    if (!circuit || !realTeamPace || !realCompoundDegradation || eligibleTeams.length === 0) return [];
+    const PIT_LOSS = 22; // seconds, typical pit-lane time loss for modern races
+    const perTeam = eligibleTeams.map(t => {
+      const pace = realTeamPace.get(t.name);
+      if (!pace) return null;
+      const deg = realCompoundDegradation.get(t.name) ?? new Map<TireCompound, number>();
+      const results = simulateRaceStrategies({
+        team: t.name,
+        baseLapTime: pace.median,
+        degradationByCompound: deg,
+        raceLaps,
+        pitLossSeconds: PIT_LOSS
+      });
+      if (results.length === 0) return null;
+      return { team: t.name, bestStrategy: results[0], allStrategies: results, gapToLeader: 0 };
+    }).filter((e): e is NonNullable<typeof e> => e !== null);
+
+    if (perTeam.length === 0) return [];
+    const fastestTotal = Math.min(...perTeam.map(p => p.bestStrategy.totalTime));
+    perTeam.forEach(p => { p.gapToLeader = p.bestStrategy.totalTime - fastestTotal; });
+    perTeam.sort((a, b) => a.gapToLeader - b.gapToLeader);
+    return perTeam;
+  };
+
   const runSimulation = () => {
     if (!circuit || eligibleTeams.length === 0) return;
     const results = runMonteCarlo(circuit, eligibleTeams, driverOptions);
     setSimulationResults(results);
+    setRaceStrategyResults(computeRaceStrategy());
     setHasSimulated(true);
   };
 
@@ -724,6 +795,56 @@ const PredictiveSimulator: React.FC = () => {
               </div>
             </div>
           </div>
+
+          {/* Race Pace Forecast — first cut. Treats the qualifying-style
+              simulation above as a single-lap pace prediction; this section
+              extrapolates that into a full race using each team's measured
+              compound degradation and pit-loss assumptions. */}
+          {raceStrategyResults.length > 0 && (
+            <div className="bg-gray-800 rounded-xl p-6 border border-gray-700">
+              <h3 className="text-lg font-semibold text-white mb-2 flex items-center gap-2">
+                <TrendingUp className="w-5 h-5 text-blue-400" />
+                Pronóstico de Carrera ({raceLaps} vueltas)
+              </h3>
+              <p className="text-xs text-gray-400 mb-4">
+                Primer corte. Asume 22s de pérdida por pit-stop, sin Safety Car / VSC y sin efectos de tráfico. Tomar como ranking orientativo, no como tiempos absolutos.
+              </p>
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-gray-700">
+                      <th className="text-left text-gray-400 font-medium py-3">Pos</th>
+                      <th className="text-left text-gray-400 font-medium py-3">Equipo</th>
+                      <th className="text-left text-gray-400 font-medium py-3">Mejor Estrategia</th>
+                      <th className="text-right text-gray-400 font-medium py-3">Tiempo Total</th>
+                      <th className="text-right text-gray-400 font-medium py-3">Gap al Líder</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {raceStrategyResults.map((row, index) => {
+                      const mins = Math.floor(row.bestStrategy.totalTime / 60);
+                      const secs = row.bestStrategy.totalTime - mins * 60;
+                      return (
+                        <tr key={row.team} className="border-b border-gray-700/50 hover:bg-gray-700/30">
+                          <td className="py-3 text-gray-400 font-mono">{index + 1}</td>
+                          <td className="py-3 text-white font-medium">{row.team}</td>
+                          <td className="py-3 text-blue-300 text-xs">{row.bestStrategy.strategy}</td>
+                          <td className="py-3 text-right text-white font-mono">
+                            {mins}:{secs.toFixed(1).padStart(4, '0')}
+                          </td>
+                          <td className="py-3 text-right font-mono">
+                            {index === 0
+                              ? <span className="text-green-400">+0.0s</span>
+                              : <span className="text-amber-300">+{row.gapToLeader.toFixed(1)}s</span>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           {/* Detailed Results Table */}
           <div className="bg-gray-800 rounded-xl p-6 border border-gray-700">

@@ -626,6 +626,142 @@ export function topologyWeights(sessionType: SessionTypeLite): TopologyWeights {
   return { downforce: 0.40, topSpeed: 0.30, tire: 0.05, braking: 0.25 };
 }
 
+// Per-compound degradation slopes for a team. Same OLS-with-2σ-trim used by
+// computeTireManagement, but returns the raw signed slope (seconds gained
+// per lap of tire age) per compound the team actually ran, so the race-pace
+// forecaster can apply the right degradation for each stint.
+export type TireCompound = 'Soft' | 'Medium' | 'Hard';
+
+export function computeCompoundDegradation(laps: Lap[]): Map<TireCompound, number> {
+  const out = new Map<TireCompound, number>();
+  const clean = laps.filter(isCleanLap);
+  const byCompound = new Map<TireCompound, Lap[]>();
+  clean.forEach(l => {
+    const arr = byCompound.get(l.tireCompound) ?? [];
+    arr.push(l);
+    byCompound.set(l.tireCompound, arr);
+  });
+  byCompound.forEach((group, compound) => {
+    if (group.length < 3) return;
+    const times = group.map(l => l.fuelCorrectedTime);
+    const med = median(times);
+    const sigma = stdDev(times);
+    const filtered = sigma > 0
+      ? group.filter(l => Math.abs(l.fuelCorrectedTime - med) <= 2 * sigma)
+      : group;
+    if (filtered.length < 3) return;
+    const xs = filtered.map(l => l.tireAge);
+    const ys = filtered.map(l => l.fuelCorrectedTime);
+    out.set(compound, linearSlope(xs, ys));
+  });
+  return out;
+}
+
+export interface RaceStrategyInput {
+  team: string;
+  baseLapTime: number;             // team's reference clean lap time (seconds)
+  degradationByCompound: Map<TireCompound, number>; // seconds per lap of age
+  raceLaps: number;
+  pitLossSeconds: number;
+  compoundOffset?: Partial<Record<TireCompound, number>>; // pace delta vs Medium baseline
+}
+
+export interface RaceStrategyResult {
+  team: string;
+  strategy: string;            // human-readable, e.g. "1-Stop M-H"
+  stops: number;
+  stints: Array<{ compound: TireCompound; laps: number }>;
+  totalTime: number;           // seconds, sum of lap times + pit losses
+  gapToBest: number;           // seconds vs the fastest strategy across this team
+}
+
+// Default compound pace deltas (s/lap vs Medium reference). Reasonable
+// average across modern compounds; teams could deviate but we don't have a
+// per-team measurement, so these are constants.
+const DEFAULT_COMPOUND_OFFSET: Record<TireCompound, number> = {
+  Soft: -0.4,
+  Medium: 0,
+  Hard: 0.5
+};
+
+// Total race time for a given stint plan, integrating the team's compound
+// degradation linearly across each stint and adding pit losses between
+// stints. Caller can build different stint plans (1-stop, 2-stop, …) and
+// compare.
+function totalRaceTime(plan: Array<{ compound: TireCompound; laps: number }>,
+                       baseLap: number,
+                       deg: Map<TireCompound, number>,
+                       pitLoss: number,
+                       offsets: Record<TireCompound, number>): number {
+  let total = 0;
+  plan.forEach((stint, idx) => {
+    const offset = offsets[stint.compound] ?? 0;
+    const slope = deg.get(stint.compound) ?? 0.05; // mild deg fallback
+    for (let lap = 0; lap < stint.laps; lap++) {
+      // Lap time = base + compound offset + degradation × tire age (in this stint).
+      total += baseLap + offset + slope * lap;
+    }
+    if (idx < plan.length - 1) total += pitLoss;
+  });
+  return total;
+}
+
+// First-cut race strategy comparator. Builds a handful of canonical 1-stop
+// and 2-stop plans (compound choice + even-ish stint splits), evaluates each
+// against the team's degradation profile, and returns them ordered by total
+// time. Intentionally coarse: no Safety Car / VSC, no track-position effects,
+// no per-team compound offsets.
+export function simulateRaceStrategies(input: RaceStrategyInput): RaceStrategyResult[] {
+  const { team, baseLapTime, degradationByCompound, raceLaps, pitLossSeconds } = input;
+  const offsets = { ...DEFAULT_COMPOUND_OFFSET, ...(input.compoundOffset ?? {}) };
+
+  const split = (parts: number): number[] => {
+    const base = Math.floor(raceLaps / parts);
+    const rem = raceLaps - base * parts;
+    return Array.from({ length: parts }, (_, i) => base + (i < rem ? 1 : 0));
+  };
+
+  const oneStopSplit = split(2);
+  const twoStopSplit = split(3);
+
+  const candidates: Array<{ label: string; plan: Array<{ compound: TireCompound; laps: number }> }> = [
+    { label: '1-Stop M→H', plan: [
+      { compound: 'Medium', laps: oneStopSplit[0] },
+      { compound: 'Hard', laps: oneStopSplit[1] }
+    ]},
+    { label: '1-Stop S→M', plan: [
+      { compound: 'Soft', laps: oneStopSplit[0] },
+      { compound: 'Medium', laps: oneStopSplit[1] }
+    ]},
+    { label: '2-Stop M→S→M', plan: [
+      { compound: 'Medium', laps: twoStopSplit[0] },
+      { compound: 'Soft', laps: twoStopSplit[1] },
+      { compound: 'Medium', laps: twoStopSplit[2] }
+    ]},
+    { label: '2-Stop S→M→S', plan: [
+      { compound: 'Soft', laps: twoStopSplit[0] },
+      { compound: 'Medium', laps: twoStopSplit[1] },
+      { compound: 'Soft', laps: twoStopSplit[2] }
+    ]}
+  ];
+
+  const evaluated = candidates.map(c => ({
+    team,
+    strategy: c.label,
+    stops: c.plan.length - 1,
+    stints: c.plan,
+    totalTime: totalRaceTime(c.plan, baseLapTime, degradationByCompound, pitLossSeconds, offsets),
+    gapToBest: 0
+  }));
+
+  evaluated.sort((a, b) => a.totalTime - b.totalTime);
+  if (evaluated.length > 0) {
+    const best = evaluated[0].totalTime;
+    evaluated.forEach(e => { e.gapToBest = e.totalTime - best; });
+  }
+  return evaluated;
+}
+
 // 2026 mode-fit penalty — compares the team's measured X-mode vs Z-mode
 // usage share to what the circuit profile implies the optimal split should
 // be. A team that runs X-mode rarely on Monza (high topSpeedImportance)
