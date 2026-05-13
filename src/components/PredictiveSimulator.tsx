@@ -421,7 +421,9 @@ const PredictiveSimulator: React.FC = () => {
       const teamLaps = realTeamLaps?.get(t.name) ?? [];
       const centeredPool = computeRaceableLapPool(teamLaps, teamIdeal);
       const medianDelta = centeredPool.length > 0 ? quantile(centeredPool, 0.5) : 0.3;
-      const baseLapTime = teamIdeal + medianDelta;
+      const chars = realCharacteristics?.get(t.name) ?? { traction: 50, downforce: 50, drag: 50, tireManagement: 50, braking: 50 };
+      const topologyPenalty = calculateTopologyMismatch(chars, circuit, 'R');
+      const baseLapTime = teamIdeal + medianDelta + topologyPenalty;
       const deg = realCompoundDegradation.get(t.name) ?? new Map<TireCompound, number>();
       const results = simulateRaceStrategies({
         team: t.name,
