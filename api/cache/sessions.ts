@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getTursoClient } from '../turso';
+import { getTursoClient } from '../_lib/turso';
 
 // GET /api/cache/sessions → [{ sessionKey, year, round, sessionType, sessionName, circuitId }]
 export default async function handler(req: VercelRequest, res: VercelResponse) {

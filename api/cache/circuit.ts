@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getTursoClient } from '../turso.ts';
+import { getTursoClient } from '../_lib/turso';
 
 // GET /api/cache/circuit?circuitId=...   → { data } | { data: null }
 // POST /api/cache/circuit  { circuitId, data }
