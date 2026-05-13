@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getTursoClient } from '../turso';
+import { getTursoClient } from '../turso.ts';
 
 // GET /api/cache/weather?sessionKey=...   → { summary } | { summary: null }
 // POST /api/cache/weather  { sessionKey, summary }
