@@ -286,35 +286,56 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
               };
         });
 
-        // Drivers/teams shown in the UI: pool by driver_number from cached telemetry+laps.
-        const cachedDriverNumbers = new Set<number>();
-        const extractNumber = (key: string) => Number(key.split('_')[0]);
-        Object.keys(hydration.telemetry).forEach(k => {
-          const n = extractNumber(k);
-          if (Number.isFinite(n)) cachedDriverNumbers.add(n);
-        });
-        Object.keys(hydration.laps).forEach(k => {
-          const n = extractNumber(k);
-          if (Number.isFinite(n)) cachedDriverNumbers.add(n);
+        // Drivers/teams shown in the UI: derive from (year, driverNumber) tuples
+        // present in cache, NOT a flat union of every catalogue year. Without this
+        // scoping, driver.id (= driverNumber, year-less) collides across seasons
+        // and retired drivers / disbanded teams leak into recent-year views.
+        const cachedDriverYearPairs = new Set<string>(); // `${year}_${number}`
+        const parseKey = (k: string) => {
+          const parts = k.split('_');
+          if (parts.length < 4) return null;
+          const number = Number(parts[0]);
+          const year = Number(parts[1]);
+          if (!Number.isFinite(number) || !Number.isFinite(year)) return null;
+          return { number, year };
+        };
+        [...Object.keys(hydration.telemetry), ...Object.keys(hydration.laps)].forEach(k => {
+          const p = parseKey(k);
+          if (p) cachedDriverYearPairs.add(`${p.year}_${p.number}`);
         });
 
-        const allCatalogDrivers = Object.values(driversByYear).flat();
+        // Walk years newest → oldest so the latest year's identity wins on duplicate
+        // driver numbers (id collision). The 2026 entry for #3 is added before the
+        // 2023 one, blocking the stale Ricciardo record from masquerading as 2026.
+        const yearsDesc = Object.keys(driversByYear)
+          .map(Number)
+          .filter(y => Number.isFinite(y))
+          .sort((a, b) => b - a);
+
         const seenDriverIds = new Set<string>();
         const hydratedDrivers: Driver[] = [];
-        allCatalogDrivers.forEach(d => {
-          if (cachedDriverNumbers.has(d.number) && !seenDriverIds.has(d.id)) {
+        yearsDesc.forEach(year => {
+          (driversByYear[year] ?? []).forEach(d => {
+            if (!cachedDriverYearPairs.has(`${year}_${d.number}`)) return;
+            if (seenDriverIds.has(d.id)) return;
             hydratedDrivers.push(d);
             seenDriverIds.add(d.id);
-          }
+          });
         });
 
+        // Only include teams whose name is actually used by a hydrated driver.
+        // Prevents extinct outfits (Alfa Romeo, AlphaTauri…) leaking in from older
+        // cached seasons that no longer have any active driver attached.
+        const teamNamesInUse = new Set(hydratedDrivers.map(d => d.team));
         const seenTeamIds = new Set<string>();
         const hydratedTeams: Team[] = [];
-        Object.values(teamsByYear).flat().forEach(t => {
-          if (!seenTeamIds.has(t.id)) {
+        yearsDesc.forEach(year => {
+          (teamsByYear[year] ?? []).forEach(t => {
+            if (!teamNamesInUse.has(t.name)) return;
+            if (seenTeamIds.has(t.id)) return;
             hydratedTeams.push(t);
             seenTeamIds.add(t.id);
-          }
+          });
         });
 
         setDownloaded({
