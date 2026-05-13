@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "WebFetch(domain:api.openf1.org)",
+      "Bash(curl -s --max-time 10 \"https://api.openf1.org/v1/meetings?year=2026\")",
+      "Bash(curl -s --max-time 10 -I \"https://api.openf1.org/v1/meetings?year=2026\")",
+      "Bash(curl -s --max-time 10 -D - \"https://api.openf1.org/v1/meetings?year=2026\")",
+      "Bash(curl -s --max-time 10 -D - -H \"Origin: http://localhost:5173\" \"https://api.openf1.org/v1/meetings?year=2026\")",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Usuario\\\\Desktop\\\\Claude\\\\formula-one\" -Recurse -File)",
+      "Bash(Select-Object -First 50)",
+      "Bash(xargs grep -l \"softmax\\\\|normalize\")",
+      "Bash(npx tsc *)",
+      "Bash(echo \"EXIT=$?\")"
+    ]
+  }
+}

@@ -411,15 +411,20 @@ const PredictiveSimulator: React.FC = () => {
   }>>([]);
 
   const computeRaceStrategy = (): typeof raceStrategyResults => {
-    if (!circuit || !realTeamPace || !realCompoundDegradation || eligibleTeams.length === 0) return [];
+    if (!circuit || !realCompoundDegradation || eligibleTeams.length === 0) return [];
     const PIT_LOSS = 22; // seconds, typical pit-lane time loss for modern races
     const perTeam = eligibleTeams.map(t => {
-      const pace = realTeamPace.get(t.name);
-      if (!pace) return null;
+      const idealEntry = realIdealRanking?.get(t.name);
+      if (!idealEntry) return null;
+      const teamIdeal = idealEntry.idealLap;
+      const teamLaps = realTeamLaps?.get(t.name) ?? [];
+      const centeredPool = computeRaceableLapPool(teamLaps, teamIdeal);
+      const medianDelta = centeredPool.length > 0 ? quantile(centeredPool, 0.5) : 0.3;
+      const baseLapTime = teamIdeal + medianDelta;
       const deg = realCompoundDegradation.get(t.name) ?? new Map<TireCompound, number>();
       const results = simulateRaceStrategies({
         team: t.name,
-        baseLapTime: pace.median,
+        baseLapTime,
         degradationByCompound: deg,
         raceLaps,
         pitLossSeconds: PIT_LOSS
