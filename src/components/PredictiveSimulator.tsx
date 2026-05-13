@@ -209,6 +209,21 @@ const PredictiveSimulator: React.FC = () => {
     [teamOptions, eligibleTeams]
   );
 
+  // Teams whose total available laps are below the "trust the variance"
+  // threshold. The bootstrap can still run but the spread it draws from is
+  // anecdotal; flag it visibly so the user knows the probability bands are
+  // wide.
+  const LOW_CONFIDENCE_LAPS = 8;
+  const lowConfidenceTeams = useMemo(() => {
+    if (!realTeamLaps) return [] as Array<{ team: string; laps: number }>;
+    const out: Array<{ team: string; laps: number }> = [];
+    eligibleTeams.forEach(t => {
+      const laps = realTeamLaps.get(t.name)?.length ?? 0;
+      if (laps > 0 && laps < LOW_CONFIDENCE_LAPS) out.push({ team: t.name, laps });
+    });
+    return out;
+  }, [eligibleTeams, realTeamLaps]);
+
   // Pick the best session for the selected circuit; prefer Q (closer to the simulator's intent)
   const activeSessionType: SessionTypeLite = useMemo(() => {
     if (!circuit) return 'Q';
@@ -394,6 +409,11 @@ const PredictiveSimulator: React.FC = () => {
           <h2 className="text-2xl font-bold text-white flex items-center gap-2">
             <Calculator className="w-6 h-6 text-green-500" />
             Simulador Predictivo (Monte Carlo)
+            {isModernRegulations(activeSessionYear) && (
+              <span className="text-[10px] font-semibold uppercase tracking-wider bg-cyan-900/50 text-cyan-300 border border-cyan-700/60 px-2 py-0.5 rounded">
+                Reglamento {activeSessionYear} · X/Z aero
+              </span>
+            )}
           </h2>
           <p className="text-gray-400 text-sm mt-1">
             Simulación de 10,000 escenarios reactiva a la selección del FastF1 Loader
@@ -577,6 +597,20 @@ const PredictiveSimulator: React.FC = () => {
             <p className="text-gray-400 text-xs">
               {Array.from(partialTeams.entries()).map(([team, info]) => `${team} (${info.loaded}/${info.expected} pilotos)`).join(', ')}.
               El cálculo aún funciona porque usa la vuelta ideal del piloto disponible, pero la varianza puede ser menor de lo real.
+            </p>
+          </div>
+        </div>
+      )}
+      {lowConfidenceTeams.length > 0 && downloaded.lastUpdate && (
+        <div className="bg-amber-900/10 border border-amber-800/40 rounded-xl p-3 flex items-start gap-3">
+          <AlertTriangle className="w-4 h-4 text-amber-300 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="text-amber-200 text-sm font-medium mb-1">
+              Equipos con muestra de vueltas baja ({lowConfidenceTeams.length})
+            </p>
+            <p className="text-gray-400 text-xs">
+              {lowConfidenceTeams.map(t => `${t.team} (${t.laps} vueltas)`).join(', ')}.
+              Por debajo de {LOW_CONFIDENCE_LAPS} vueltas el bootstrap saca de un pool muy fino y la probabilidad de victoria se amplía.
             </p>
           </div>
         </div>

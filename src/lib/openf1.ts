@@ -51,6 +51,12 @@ type OpenF1Driver = {
   headshot_url?: string;
 };
 
+// NOTE (2026 regs): OpenF1 has not exposed an aero-mode (X/Z) channel nor a
+// Manual Override (MGU-K boost) deployment field as of writing. If a future
+// schema adds them, surface them here as e.g. `mode: 'X' | 'Z' | null` and
+// `override_active: 0 | 1`, then thread through to TelemetryPoint and the
+// proxies in teamMetrics.ts. Until then the mode-fit penalty relies on
+// computeAeroModeShare's throttle/RPM heuristic.
 type OpenF1CarData = {
   date: string;
   driver_number: number;

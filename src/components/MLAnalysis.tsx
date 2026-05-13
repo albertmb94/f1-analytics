@@ -1,7 +1,14 @@
 import React, { useState, useMemo } from 'react';
 import { useData } from '../context/DataContext';
 import type { MLInsight } from '../types/f1';
-import { aggregateTeamMetrics, computePaceMaps, computeTeamIdealRanking, type TeamMetrics, type TeamIdealEntry } from '../lib/teamMetrics';
+import {
+  aggregateTeamMetrics,
+  computePaceMaps,
+  computeTeamIdealRanking,
+  isModernRegulations,
+  type TeamMetrics,
+  type TeamIdealEntry
+} from '../lib/teamMetrics';
 import { filterDatasetByActiveSessions } from '../lib/activeDataset';
 import {
   Brain,
@@ -27,46 +34,175 @@ import {
 } from 'recharts';
 import { motion } from 'framer-motion';
 
-// Deterministic pseudo-random from string seed
-function seededRandom(seed: string): () => number {
-  let h = Array.from(seed).reduce((acc, c) => Math.imul(31, acc) + c.charCodeAt(0) | 0, 0);
-  return () => {
-    h ^= h << 13; h ^= h >> 17; h ^= h << 5;
-    return (h >>> 0) / 0xFFFFFFFF;
-  };
+// Pearson correlation between two parallel numeric arrays. Returns 0 when the
+// sample is degenerate (n<2 or zero variance in either side).
+function pearson(xs: number[], ys: number[]): number {
+  const n = Math.min(xs.length, ys.length);
+  if (n < 2) return 0;
+  let sx = 0, sy = 0;
+  for (let i = 0; i < n; i++) { sx += xs[i]; sy += ys[i]; }
+  const mx = sx / n, my = sy / n;
+  let num = 0, dx = 0, dy = 0;
+  for (let i = 0; i < n; i++) {
+    const a = xs[i] - mx;
+    const b = ys[i] - my;
+    num += a * b;
+    dx += a * a;
+    dy += b * b;
+  }
+  if (dx === 0 || dy === 0) return 0;
+  return num / Math.sqrt(dx * dy);
 }
 
-// Build ML insights from actual downloaded data
-function buildInsights(
-  teams: import('../types/f1').Team[],
-  drivers: import('../types/f1').Driver[],
-  lapsData: Record<string, import('../types/f1').Lap[]>
-): MLInsight[] {
-  return teams.map(team => {
-    const rng = seededRandom(team.id);
-    const teamDrivers = drivers.filter((d: import('../types/f1').Driver) => d.team === team.name);
+function mean(xs: number[]): number {
+  return xs.length === 0 ? 0 : xs.reduce((s, v) => s + v, 0) / xs.length;
+}
 
-    // Compute mean pace from downloaded laps for this team's drivers
+function popStddev(xs: number[]): number {
+  if (xs.length < 2) return 0;
+  const m = mean(xs);
+  return Math.sqrt(xs.reduce((s, v) => s + (v - m) ** 2, 0) / xs.length);
+}
+
+interface BuildInsightsInput {
+  teams: import('../types/f1').Team[];
+  drivers: import('../types/f1').Driver[];
+  lapsData: Record<string, import('../types/f1').Lap[]>;
+  characteristics: Map<string, TeamMetrics>;
+  idealRanking: TeamIdealEntry[];
+  year: number;
+}
+
+// Map a 2026-aware feature label to the underlying TeamMetrics key it reads
+// from. The same metric key powers each label; only its presentation name
+// changes between regulation eras.
+function featureSpec(year: number): Array<{ label: string; key: keyof TeamMetrics; betterWhen: 'high' | 'low' }> {
+  const modern = isModernRegulations(year);
+  return [
+    { label: 'Traction Out of Corner', key: 'traction', betterWhen: 'high' },
+    { label: 'Tire Deg Slope',        key: 'tireManagement', betterWhen: 'high' },
+    { label: 'Braking Power',         key: 'braking', betterWhen: 'high' },
+    {
+      label: modern ? 'X-Mode Top Speed' : 'Low-Drag Top Speed',
+      key: 'drag',
+      betterWhen: 'high' // drag is already inverted in TeamMetrics
+    },
+    {
+      label: modern ? 'Z-Mode Apex Speed' : 'Downforce Proxy',
+      key: 'downforce',
+      betterWhen: 'high'
+    }
+  ];
+}
+
+// Build honest ML insights from actual downloaded data. No seeded randomness:
+// every figure is derived from telemetry/laps via the proxies and the team's
+// ideal-lap ranking.
+function buildInsights({
+  teams,
+  drivers,
+  lapsData,
+  characteristics,
+  idealRanking,
+  year
+}: BuildInsightsInput): Array<MLInsight & { meanPace: number; teamDrivers: import('../types/f1').Driver[]; sampleConfidence: 'high' | 'medium' | 'low' }> {
+  const features = featureSpec(year);
+
+  // For each feature, gather (proxyValue, idealLap) tuples across teams to
+  // compute the global correlation of that feature with race-relevant pace.
+  // Lower idealLap = faster, so we negate it to get "higher = better" axis.
+  const teamFeatureValues = new Map<string, Map<string, number>>();
+  const idealByTeam = new Map<string, number>();
+  idealRanking.forEach(e => idealByTeam.set(e.team, e.idealLap));
+
+  features.forEach(f => teamFeatureValues.set(f.key, new Map()));
+  teams.forEach(team => {
+    const c = characteristics.get(team.name);
+    if (!c) return;
+    features.forEach(f => teamFeatureValues.get(f.key)!.set(team.name, c[f.key] as number));
+  });
+
+  // Compute correlation (and per-feature pool stats) once across the grid.
+  const featureStats = new Map<string, { r: number; mean: number; stddev: number }>();
+  features.forEach(f => {
+    const values: number[] = [];
+    const targets: number[] = [];
+    teamFeatureValues.get(f.key)!.forEach((v, team) => {
+      const ideal = idealByTeam.get(team);
+      if (typeof v !== 'number' || !Number.isFinite(v) || typeof ideal !== 'number') return;
+      values.push(v);
+      // Negate so higher = faster on this axis. Sign of correlation now
+      // matches betterWhen: features that should be high in a fast team
+      // produce positive r.
+      targets.push(-ideal);
+    });
+    const r = pearson(values, targets);
+    featureStats.set(f.key, { r, mean: mean(values), stddev: popStddev(values) });
+  });
+
+  return teams.map(team => {
+    const teamDrivers = drivers.filter(d => d.team === team.name);
+    const c = characteristics.get(team.name);
+
+    // Mean pace from clean laps (unchanged).
     let totalPace = 0, lapCount = 0;
+    const perDriverTimes = new Map<string, number[]>();
     Object.entries(lapsData).forEach(([key, laps]) => {
       const driverId = key.split('_')[0];
-      if (teamDrivers.some((d: import('../types/f1').Driver) => d.id === driverId)) {
-        (laps as import('../types/f1').Lap[]).forEach((lap: import('../types/f1').Lap) => { totalPace += lap.fuelCorrectedTime; lapCount++; });
-      }
+      const owned = teamDrivers.some(d => d.id === driverId);
+      if (!owned) return;
+      const arr = perDriverTimes.get(driverId) ?? [];
+      laps.forEach(lap => {
+        totalPace += lap.fuelCorrectedTime;
+        lapCount += 1;
+        arr.push(lap.fuelCorrectedTime);
+      });
+      perDriverTimes.set(driverId, arr);
     });
     const meanPace = lapCount > 0 ? totalPace / lapCount : team.basePace;
 
-    // Machine vs driver split: derived from variance relative to peers
-    const machineImpact = Math.round(55 + rng() * 25);
-    const driverImpact = 100 - machineImpact;
+    // Real machine/driver impact via variance decomposition.
+    //   intra = mean of within-driver stddev (consistency of one driver)
+    //   inter = stddev of per-driver medians (how different the team-mates are)
+    // Higher inter relative to intra → driver identity matters more.
+    const driverArrays = Array.from(perDriverTimes.values()).filter(arr => arr.length >= 3);
+    let driverImpact: number;
+    let machineImpact: number;
+    let sampleConfidence: 'high' | 'medium' | 'low';
+    if (driverArrays.length >= 2) {
+      const intra = mean(driverArrays.map(popStddev));
+      const medians = driverArrays.map(arr => {
+        const sorted = [...arr].sort((a, b) => a - b);
+        return sorted[Math.floor(sorted.length / 2)];
+      });
+      const inter = popStddev(medians);
+      const total = intra + inter;
+      const ratio = total > 0 ? inter / total : 0.5;
+      driverImpact = Math.round(Math.max(10, Math.min(90, ratio * 100)));
+      machineImpact = 100 - driverImpact;
+      sampleConfidence = driverArrays.every(arr => arr.length >= 8) ? 'high' : 'medium';
+    } else if (driverArrays.length === 1) {
+      // Only one driver loaded — can't separate driver vs machine. Default
+      // 50/50 but flag as low confidence.
+      driverImpact = 50;
+      machineImpact = 50;
+      sampleConfidence = 'low';
+    } else {
+      driverImpact = 50;
+      machineImpact = 50;
+      sampleConfidence = 'low';
+    }
 
-    const features = [
-      'Traction Proxy', 'Tire Deg Slope', 'DRS Efficiency', 'Brake Stability', 'Downforce Proxy'
-    ];
-    const shapValues = features.map(feature => ({
-      feature,
-      value: parseFloat((0.08 + rng() * 0.26).toFixed(3))
-    })).sort((a, b) => b.value - a.value);
+    // Per-team feature contributions: r * z_i across each proxy. Sign retained
+    // — positive means "this team is above grid average in a trait that
+    // correlates with being fast". Display layer takes the abs and sorts.
+    const shapValues = features.map(f => {
+      const stats = featureStats.get(f.key)!;
+      const proxyValue = c ? (c[f.key] as number) : stats.mean;
+      const z = stats.stddev > 0 ? (proxyValue - stats.mean) / stats.stddev : 0;
+      const signed = stats.r * z;
+      return { feature: f.label, value: parseFloat(signed.toFixed(3)) };
+    }).sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
 
     return {
       team: team.name,
@@ -74,8 +210,9 @@ function buildInsights(
       driverImpact,
       shapValues,
       meanPace,
-      teamDrivers
-    } as MLInsight & { meanPace: number; teamDrivers: typeof teamDrivers };
+      teamDrivers,
+      sampleConfidence
+    };
   });
 }
 
@@ -138,14 +275,30 @@ const MLAnalysis: React.FC = () => {
   const driverNameById = (driverId: string): string =>
     resolvedDownloadDrivers.find(d => d.id === driverId)?.name ?? `#${driverId}`;
 
+  // Most recent year in the active sessions — drives feature labels (2026
+  // swaps DRS terminology for X-mode / Z-mode).
+  const activeYear = useMemo(() => {
+    const sessions = downloadedData.sessions ?? [];
+    if (sessions.length === 0) return new Date().getUTCFullYear();
+    return Math.max(...sessions.map(s => s.year));
+  }, [downloadedData.sessions]);
+
   const insights = useMemo(() => {
     // Restrict to teams that actually have data in the active sessions —
     // never include teams from the catalogue that aren't running this season.
     const teamsWithRealData = new Set(idealRanking.map(e => e.team));
     const teamsToUse = availableTeams.filter(t => teamsWithRealData.has(t.name));
     const driversToUse = resolvedDownloadDrivers.length > 0 ? resolvedDownloadDrivers : [];
-    return buildInsights(teamsToUse, driversToUse, downloadedData.laps);
-  }, [availableTeams, resolvedDownloadDrivers, downloadedData, idealRanking]);
+    const characteristics = realTeamData?.characteristics ?? new Map();
+    return buildInsights({
+      teams: teamsToUse,
+      drivers: driversToUse,
+      lapsData: downloadedData.laps,
+      characteristics,
+      idealRanking,
+      year: activeYear
+    });
+  }, [availableTeams, resolvedDownloadDrivers, downloadedData, idealRanking, realTeamData, activeYear]);
 
   const teamCharacteristics = (team: import('../types/f1').Team): TeamMetrics => {
     const real = realTeamData?.characteristics.get(team.name);
@@ -169,7 +322,8 @@ const MLAnalysis: React.FC = () => {
     return `${team.basePace.toFixed(3)} s*`;
   };
 
-  const [selectedInsight, setSelectedInsight] = useState<MLInsight | null>(insights[0] || null);
+  type Insight = (typeof insights)[number];
+  const [selectedInsight, setSelectedInsight] = useState<Insight | null>(insights[0] || null);
   const [activeTab, setActiveTab] = useState<'clustering' | 'decoupling' | 'shap'>('clustering');
 
   // Update selected when insights refresh
@@ -216,7 +370,13 @@ const MLAnalysis: React.FC = () => {
             <Brain className="w-6 h-6 text-purple-500" />
             Motor de Machine Learning
           </h2>
-          <p className="text-gray-400 text-sm mt-1">Clustering, desacoplamiento y análisis SHAP</p>
+          <p className="text-gray-400 text-sm mt-1">Clustering, desacoplamiento y análisis de importancia por feature
+            {isModernRegulations(activeYear) && (
+              <span className="ml-2 text-[10px] font-semibold uppercase tracking-wider bg-cyan-900/50 text-cyan-300 border border-cyan-700/60 px-2 py-0.5 rounded">
+                Reglamento {activeYear} · X/Z aero
+              </span>
+            )}
+          </p>
         </div>
         <div className="bg-yellow-900/20 border border-yellow-700 rounded-xl p-8 text-center">
           <AlertCircle className="w-12 h-12 text-yellow-500 mx-auto mb-3" />
@@ -251,7 +411,7 @@ const MLAnalysis: React.FC = () => {
         {([
           { id: 'clustering', label: 'Clustering Chasis', icon: BarChart3 },
           { id: 'decoupling', label: 'Piloto vs Máquina', icon: GitCompare },
-          { id: 'shap', label: 'Análisis SHAP', icon: Target },
+          { id: 'shap', label: 'Importancia (r·z)', icon: Target },
         ] as const).map(({ id, label, icon: Icon }) => (
           <button
             key={id}
@@ -440,19 +600,33 @@ const MLAnalysis: React.FC = () => {
       {activeTab === 'shap' && (
         <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
           <div className="flex gap-2 flex-wrap">
-            {insights.map(ins => (
-              <button
-                key={ins.team}
-                onClick={() => setSelectedInsight(ins)}
-                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
-                  selectedInsight?.team === ins.team
-                    ? 'bg-purple-600 text-white'
-                    : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-                }`}
-              >
-                {ins.team.split(' ').slice(0, 2).join(' ')}
-              </button>
-            ))}
+            {insights.map(ins => {
+              const confidenceDot = ins.sampleConfidence === 'high'
+                ? 'bg-emerald-400'
+                : ins.sampleConfidence === 'medium'
+                  ? 'bg-amber-400'
+                  : 'bg-red-400';
+              const confidenceTitle = ins.sampleConfidence === 'high'
+                ? 'Muestra robusta (≥8 vueltas por piloto, ≥2 pilotos)'
+                : ins.sampleConfidence === 'medium'
+                  ? 'Muestra moderada (≥2 pilotos pero pocas vueltas)'
+                  : 'Muestra limitada (1 piloto o sin vueltas suficientes)';
+              return (
+                <button
+                  key={ins.team}
+                  onClick={() => setSelectedInsight(ins)}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center gap-2 ${
+                    selectedInsight?.team === ins.team
+                      ? 'bg-purple-600 text-white'
+                      : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                  }`}
+                  title={confidenceTitle}
+                >
+                  <span className={`w-2 h-2 rounded-full ${confidenceDot}`} />
+                  {ins.team.split(' ').slice(0, 2).join(' ')}
+                </button>
+              );
+            })}
           </div>
 
           {selectedInsight && (
@@ -460,7 +634,7 @@ const MLAnalysis: React.FC = () => {
               <div className="bg-gray-800 rounded-xl p-6 border border-gray-700">
                 <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
                   <Target className="w-5 h-5 text-purple-500" />
-                  SHAP Values — {selectedInsight.team}
+                  Importancia de feature — {selectedInsight.team}
                 </h3>
                 <div className="h-80">
                   <ResponsiveContainer width="100%" height="100%">
@@ -494,7 +668,7 @@ const MLAnalysis: React.FC = () => {
                           <div className="mt-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
                             <div
                               className="h-full rounded-full"
-                              style={{ width: `${(sv.value / 0.35) * 100}%`, backgroundColor: shapData[i]?.color }}
+                              style={{ width: `${Math.min(100, (Math.abs(sv.value) / 1.5) * 100)}%`, backgroundColor: shapData[i]?.color }}
                             />
                           </div>
                         </div>
@@ -509,7 +683,7 @@ const MLAnalysis: React.FC = () => {
                     <div>
                       <h5 className="text-purple-400 font-medium mb-1">ADN del Chasis</h5>
                       <p className="text-gray-400 text-sm">
-                        El feature más influyente es <strong className="text-white">{selectedInsight.shapValues[0]?.feature}</strong> con un SHAP de{' '}
+                        El feature más influyente es <strong className="text-white">{selectedInsight.shapValues[0]?.feature}</strong> con una importancia (r·z) de{' '}
                         <strong className="text-purple-400">{selectedInsight.shapValues[0]?.value.toFixed(3)}</strong>.
                         Esto indica que {selectedInsight.team} extrae su ventaja principalmente de esa área técnica.
                       </p>
