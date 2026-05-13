@@ -572,20 +572,34 @@ export function computeIdealVariance(laps: Lap[], sessionType: SessionTypeLite):
   return Math.max(floor, Math.min(ceiling, sigma));
 }
 
-// Returns the team's "raceable" lap-time pool: valid laps minus the team's
-// teamIdeal, so each entry is a (signed) deviation from the team's theoretical
-// best. Bootstrap-sampled in the simulator to inject realistic noise that
-// matches the team's own variability, including asymmetry and heavy tails.
+// Returns the team's "qualifying-attempt" lap pool — values are signed
+// deviations from the team's theoretical best, bootstrap-sampled by the
+// simulator. Three filters keep the pool comparable across teams regardless
+// of how much data sits in cache:
+//
+//   1. isCleanLap — drops in/out laps and laps in dirty air.
+//   2. fuelCorrectedTime — strips the practice-fuel-weight signal so a
+//      heavy FP1 lap and a light Q lap are on the same scale.
+//   3. Top-30% trim — keeps only laps a driver actually attempted near
+//      the limit. Without this trim, teams with long practice sessions
+//      cached end up with a pool whose mean is 1–2 s above teamIdeal,
+//      and the simulator's "expected pace" balloons by that mean
+//      irrespective of qualifying potential — flipping the ranking
+//      compared to the ideal-lap order.
+//
+// Returned values are clamped to ≥0: fuel correction is an estimate and can
+// occasionally over-correct below the ideal, but a "faster than ideal" sample
+// would push the team's mean below their own best microsectors, which is
+// physically nonsensical for this estimator.
 export function computeRaceableLapPool(laps: Lap[], teamIdeal: number): number[] {
   const eligible = laps
-    .map(l => l.time)
+    .filter(isCleanLap)
+    .map(l => l.fuelCorrectedTime)
     .filter(t => Number.isFinite(t) && t > 60 && t < 200);
   if (eligible.length === 0) return [];
-  // Trim the slowest tail (top ~10%) — in/out laps and traffic deltas would
-  // otherwise dominate. Keep the realistic chunk a driver would attempt.
   const sorted = [...eligible].sort((a, b) => a - b);
-  const cut = Math.max(3, Math.floor(sorted.length * 0.9));
-  return sorted.slice(0, cut).map(t => t - teamIdeal);
+  const cut = Math.max(3, Math.floor(sorted.length * 0.3));
+  return sorted.slice(0, cut).map(t => Math.max(0, t - teamIdeal));
 }
 
 // Standard Normal sampling via Box-Muller. Used for sub-lap noise floor when

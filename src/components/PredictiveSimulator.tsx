@@ -316,11 +316,17 @@ const PredictiveSimulator: React.FC = () => {
       const modePenalty = modernEra && modeShare
         ? computeModeFitPenalty(modeShare, selectedTrack.profile)
         : 0;
+      // driverAdjustment only applies to race-style sessions, where both
+      // drivers race and the team's expected pace is the lap average. For
+      // pole / single-lap predictions teamIdeal already represents the
+      // best driver's potential, so adding the slower team-mate's gap
+      // double-counts and pushes well-cached teams artificially backward.
+      const sessionAdjustment = isRace ? adjustment : 0;
       const samples = Array.from({ length: simulations }, () => {
         // Real bootstrap noise: resample a centered lap from this team's own
         // distribution. Captures asymmetric and heavy-tailed variability.
         const stochastic = sampleCenteredLap(centeredPool, fallbackSigma) * weatherFactor;
-        return effectivePace + topologyPenalty + modePenalty + adjustment + stochastic;
+        return effectivePace + topologyPenalty + modePenalty + sessionAdjustment + stochastic;
       });
       return { team, samples };
     });
