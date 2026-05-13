@@ -18,7 +18,8 @@ import {
   loadCachedDriverSession,
   saveCachedDriverSession,
   loadCachedWeather,
-  saveCachedWeather
+  saveCachedWeather,
+  loadCachedSessions
 } from '../lib/sessionCache';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,9 +149,23 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [retryProgress, setRetryProgress] = useState({ current: 0, total: 0, message: '' });
   // Sessions the user has marked as "active" in the global header selector.
   // When non-empty, every consumer filters their dataset by this set.
-  const [activeSessionKeys, setActiveSessionKeysState] = useState<Set<string>>(new Set());
+  // Persisted in localStorage so selections survive page refreshes and work across devices.
+  const [activeSessionKeys, setActiveSessionKeysState] = useState<Set<string>>(() => {
+    if (typeof window === 'undefined') return new Set();
+    try {
+      const stored = localStorage.getItem('f1-active-session-keys');
+      return stored ? new Set(JSON.parse(stored)) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
   const setActiveSessionKeys = useCallback((next: Set<string>) => {
     setActiveSessionKeysState(new Set(next));
+    try {
+      localStorage.setItem('f1-active-session-keys', JSON.stringify(Array.from(next)));
+    } catch {
+      // localStorage may be unavailable in some environments
+    }
   }, []);
   const [downloaded, setDownloaded] = useState<DownloadedData>({
     telemetry: {}, laps: {}, sessions: [], drivers: [], teams: [], failedDrivers: [], weather: {}, lastUpdate: null
@@ -242,6 +257,21 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       );
       const circuits = circuitResults.filter((c): c is Circuit => c !== null);
       setFailedCircuits(circuitFailures);
+
+      // 5) Load cached sessions from Turso to know which sessions are already available
+      const cachedSessionsMeta = await loadCachedSessions();
+      if (cachedSessionsMeta && cachedSessionsMeta.length > 0) {
+        // Pre-populate activeSessionKeys with sessions that have data in cache
+        const cachedKeys = new Set(
+          cachedSessionsMeta.map(s => `${s.sessionKey}`)
+        );
+        setActiveSessionKeysState(cachedKeys);
+        try {
+          localStorage.setItem('f1-active-session-keys', JSON.stringify(Array.from(cachedKeys)));
+        } catch {
+          // localStorage may be unavailable
+        }
+      }
 
       setCatalogue({
         years: yearPayload.map(p => p.year),
