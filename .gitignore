@@ -1,0 +1,15 @@
+node_modules
+dist
+.vercel
+
+# Local env vars (Supabase credentials etc.)
+.env
+.env.local
+.env.*.local
+
+# Editor / OS / agents
+.DS_Store
+.idea
+.vscode
+.claude
+*.log
