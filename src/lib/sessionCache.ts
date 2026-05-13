@@ -45,6 +45,17 @@ export async function loadCachedSessions(): Promise<CachedSessionMeta[] | null> 
   return r?.sessions ?? null;
 }
 
+export interface CachedHydrationPayload {
+  sessions: CachedSessionMeta[];
+  telemetry: Record<string, TelemetryPoint[]>;
+  laps: Record<string, Lap[]>;
+  weather: Record<string, SessionWeatherSummary>;
+}
+
+export async function loadCachedHydration(): Promise<CachedHydrationPayload | null> {
+  return safeFetch<CachedHydrationPayload>('/api/cache/hydrate');
+}
+
 export async function loadCachedDriverSession(
   sessionKey: number,
   driverNumber: number

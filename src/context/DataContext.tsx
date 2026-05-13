@@ -19,7 +19,7 @@ import {
   saveCachedDriverSession,
   loadCachedWeather,
   saveCachedWeather,
-  loadCachedSessions
+  loadCachedHydration
 } from '../lib/sessionCache';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,12 +258,78 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const circuits = circuitResults.filter((c): c is Circuit => c !== null);
       setFailedCircuits(circuitFailures);
 
-      // 5) Load cached sessions from Turso to know which sessions are already available
-      const cachedSessionsMeta = await loadCachedSessions();
-      if (cachedSessionsMeta && cachedSessionsMeta.length > 0) {
-        // Pre-populate activeSessionKeys with sessions that have data in cache
+      // 5) Hydrate `downloaded` from Turso so a fresh device sees every session
+      //    already cached globally without re-downloading from OpenF1.
+      const hydration = await loadCachedHydration();
+      if (hydration && hydration.sessions.length > 0) {
+        // Re-attach catalogue metadata (date, meetingKey…) where available.
+        const catalogSessionByTriple = new Map<string, FastF1Session>();
+        events.forEach(ev => {
+          ev.sessions.forEach(s => {
+            catalogSessionByTriple.set(`${s.year}_${s.round}_${s.sessionType}`, s);
+          });
+        });
+
+        const hydratedSessions: FastF1Session[] = hydration.sessions.map(s => {
+          const fromCatalog = catalogSessionByTriple.get(`${s.year}_${s.round}_${s.sessionType}`);
+          return fromCatalog
+            ? { ...fromCatalog, sessionKey: s.sessionKey ?? fromCatalog.sessionKey }
+            : {
+                year: s.year,
+                round: s.round,
+                sessionName: s.sessionName,
+                sessionType: s.sessionType as FastF1Session['sessionType'],
+                date: '',
+                circuit: s.circuitId,
+                sessionKey: s.sessionKey,
+                available: true,
+              };
+        });
+
+        // Drivers/teams shown in the UI: pool by driver_number from cached telemetry+laps.
+        const cachedDriverNumbers = new Set<number>();
+        const extractNumber = (key: string) => Number(key.split('_')[0]);
+        Object.keys(hydration.telemetry).forEach(k => {
+          const n = extractNumber(k);
+          if (Number.isFinite(n)) cachedDriverNumbers.add(n);
+        });
+        Object.keys(hydration.laps).forEach(k => {
+          const n = extractNumber(k);
+          if (Number.isFinite(n)) cachedDriverNumbers.add(n);
+        });
+
+        const allCatalogDrivers = Object.values(driversByYear).flat();
+        const seenDriverIds = new Set<string>();
+        const hydratedDrivers: Driver[] = [];
+        allCatalogDrivers.forEach(d => {
+          if (cachedDriverNumbers.has(d.number) && !seenDriverIds.has(d.id)) {
+            hydratedDrivers.push(d);
+            seenDriverIds.add(d.id);
+          }
+        });
+
+        const seenTeamIds = new Set<string>();
+        const hydratedTeams: Team[] = [];
+        Object.values(teamsByYear).flat().forEach(t => {
+          if (!seenTeamIds.has(t.id)) {
+            hydratedTeams.push(t);
+            seenTeamIds.add(t.id);
+          }
+        });
+
+        setDownloaded({
+          telemetry: hydration.telemetry,
+          laps: hydration.laps,
+          sessions: hydratedSessions,
+          drivers: hydratedDrivers,
+          teams: hydratedTeams,
+          failedDrivers: [],
+          weather: hydration.weather,
+          lastUpdate: new Date(),
+        });
+
         const cachedKeys = new Set(
-          cachedSessionsMeta.map(s => `${s.sessionKey}`)
+          hydratedSessions.map(s => `${s.year}_${s.round}_${s.sessionType}`)
         );
         setActiveSessionKeysState(cachedKeys);
         try {
