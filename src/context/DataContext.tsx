@@ -18,8 +18,7 @@ import {
   loadCachedDriverSession,
   saveCachedDriverSession,
   loadCachedWeather,
-  saveCachedWeather,
-  ensureCachedSessionMeta
+  saveCachedWeather
 } from '../lib/sessionCache';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -503,16 +502,19 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
           telemetry[key] = dataset.telemetry;
           laps[key] = dataset.laps;
           failedByKey.delete(key);
-          // Fire-and-forget: persist to Supabase for future visits
-          ensureCachedSessionMeta({
-            sessionKey: session.sessionKey,
-            year: session.year,
-            round: session.round,
-            sessionType: session.sessionType,
-            sessionName: session.sessionName,
-            circuitId: session.circuit
-          }).then(() =>
-            saveCachedDriverSession(session.sessionKey!, Number(driver.id), dataset.telemetry, dataset.laps)
+          // Fire-and-forget: persist to Turso (via /api/cache) for future visits
+          saveCachedDriverSession(
+            session.sessionKey,
+            Number(driver.id),
+            dataset.telemetry,
+            dataset.laps,
+            {
+              year: session.year,
+              round: session.round,
+              sessionType: session.sessionType,
+              sessionName: session.sessionName,
+              circuitId: session.circuit
+            }
           );
         } else {
           failedByKey.set(key, { key, driver, session, reason: dataset.reason });
@@ -662,15 +664,18 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (dataset.status === 'ok') {
           telemetry[item.key] = dataset.telemetry;
           laps[item.key] = dataset.laps;
-          ensureCachedSessionMeta({
-            sessionKey: session.sessionKey,
-            year: session.year,
-            round: session.round,
-            sessionType: session.sessionType,
-            sessionName: session.sessionName,
-            circuitId: session.circuit
-          }).then(() =>
-            saveCachedDriverSession(session.sessionKey!, Number(driver.id), dataset.telemetry, dataset.laps)
+          saveCachedDriverSession(
+            session.sessionKey,
+            Number(driver.id),
+            dataset.telemetry,
+            dataset.laps,
+            {
+              year: session.year,
+              round: session.round,
+              sessionType: session.sessionType,
+              sessionName: session.sessionName,
+              circuitId: session.circuit
+            }
           );
           return { ok: true };
         }

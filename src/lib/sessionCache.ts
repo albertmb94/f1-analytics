@@ -1,139 +1,105 @@
 import type { Circuit, Lap, TelemetryPoint } from '../types/f1';
 import type { SessionWeatherSummary } from './openf1';
-import { supabase } from './supabaseClient';
+
+// Thin client over the Vercel serverless functions in `/api/cache/*`.
+// The Turso credentials live only on the server (TURSO_DATABASE_URL / TURSO_AUTH_TOKEN);
+// the browser never sees them. Each function degrades gracefully on failure so the
+// app keeps working without cache (it just falls back to direct OpenF1 calls).
 
 export interface CachedDriverDataset {
   telemetry: TelemetryPoint[];
   laps: Lap[];
 }
 
+// Cache the result of "is the cache backend reachable?" so we don't issue dozens
+// of failed requests when running locally without Turso configured.
+let cacheDisabled = false;
+
+async function safeFetch<T>(url: string, init?: RequestInit): Promise<T | null> {
+  if (cacheDisabled) return null;
+  try {
+    const res = await fetch(url, init);
+    if (res.status === 503) {
+      // Turso not configured (typical in `npm run dev` without env vars).
+      cacheDisabled = true;
+      return null;
+    }
+    if (!res.ok) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
 export async function loadCachedDriverSession(
   sessionKey: number,
   driverNumber: number
 ): Promise<CachedDriverDataset | null> {
-  if (!supabase) return null;
-  try {
-    const [tel, lap] = await Promise.all([
-      supabase
-        .from('cached_telemetry')
-        .select('points')
-        .eq('session_key', sessionKey)
-        .eq('driver_number', driverNumber)
-        .maybeSingle(),
-      supabase
-        .from('cached_laps')
-        .select('lap_data, lap_number')
-        .eq('session_key', sessionKey)
-        .eq('driver_number', driverNumber)
-        .order('lap_number', { ascending: true })
-    ]);
-    const telPoints = (tel.data?.points as TelemetryPoint[] | undefined) ?? null;
-    const lapsRows = (lap.data as Array<{ lap_data: Lap; lap_number: number }> | null) ?? null;
-    if (!telPoints && (!lapsRows || lapsRows.length === 0)) return null;
-    return {
-      telemetry: telPoints ?? [],
-      laps: lapsRows ? lapsRows.map(r => r.lap_data) : []
-    };
-  } catch (err) {
-    console.warn('Supabase loadCachedDriverSession failed', err);
-    return null;
-  }
+  const data = await safeFetch<CachedDriverDataset>(
+    `/api/cache/driver-session?sessionKey=${sessionKey}&driverNumber=${driverNumber}`
+  );
+  if (!data) return null;
+  if ((data.laps?.length ?? 0) === 0 && (data.telemetry?.length ?? 0) === 0) return null;
+  return { telemetry: data.telemetry ?? [], laps: data.laps ?? [] };
+}
+
+export interface SaveDriverSessionMeta {
+  year: number;
+  round: number;
+  sessionType: string;
+  sessionName: string;
+  circuitId: string;
 }
 
 export async function saveCachedDriverSession(
   sessionKey: number,
   driverNumber: number,
   telemetry: TelemetryPoint[],
-  laps: Lap[]
+  laps: Lap[],
+  sessionMeta?: SaveDriverSessionMeta
 ): Promise<void> {
-  if (!supabase) return;
-  try {
-    if (telemetry.length > 0) {
-      await supabase
-        .from('cached_telemetry')
-        .upsert({ session_key: sessionKey, driver_number: driverNumber, points: telemetry });
+  await safeFetch<{ ok: boolean }>(
+    '/api/cache/driver-session',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionKey, driverNumber, telemetry, laps, sessionMeta })
     }
-    if (laps.length > 0) {
-      const rows = laps.map(l => ({
-        session_key: sessionKey,
-        driver_number: driverNumber,
-        lap_number: l.number,
-        lap_data: l
-      }));
-      await supabase.from('cached_laps').upsert(rows);
-    }
-  } catch (err) {
-    console.warn('Supabase saveCachedDriverSession failed', err);
-  }
+  );
 }
 
 export async function loadCachedWeather(sessionKey: number): Promise<SessionWeatherSummary | null> {
-  if (!supabase) return null;
-  try {
-    const { data } = await supabase
-      .from('cached_weather')
-      .select('summary')
-      .eq('session_key', sessionKey)
-      .maybeSingle();
-    return (data?.summary as SessionWeatherSummary | undefined) ?? null;
-  } catch (err) {
-    console.warn('Supabase loadCachedWeather failed', err);
-    return null;
-  }
+  const r = await safeFetch<{ summary: SessionWeatherSummary | null }>(
+    `/api/cache/weather?sessionKey=${sessionKey}`
+  );
+  return r?.summary ?? null;
 }
 
 export async function saveCachedWeather(sessionKey: number, summary: SessionWeatherSummary): Promise<void> {
-  if (!supabase) return;
-  try {
-    await supabase.from('cached_weather').upsert({ session_key: sessionKey, summary });
-  } catch (err) {
-    console.warn('Supabase saveCachedWeather failed', err);
-  }
+  await safeFetch<{ ok: boolean }>(
+    '/api/cache/weather',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionKey, summary })
+    }
+  );
 }
 
 export async function loadCachedCircuit(circuitId: string): Promise<Circuit | null> {
-  if (!supabase) return null;
-  try {
-    const { data } = await supabase
-      .from('cached_circuits')
-      .select('data')
-      .eq('circuit_id', circuitId)
-      .maybeSingle();
-    return (data?.data as Circuit | undefined) ?? null;
-  } catch (err) {
-    console.warn('Supabase loadCachedCircuit failed', err);
-    return null;
-  }
+  const r = await safeFetch<{ data: Circuit | null }>(
+    `/api/cache/circuit?circuitId=${encodeURIComponent(circuitId)}`
+  );
+  return r?.data ?? null;
 }
 
 export async function saveCachedCircuit(circuit: Circuit): Promise<void> {
-  if (!supabase) return;
-  try {
-    await supabase.from('cached_circuits').upsert({ circuit_id: circuit.id, data: circuit });
-  } catch (err) {
-    console.warn('Supabase saveCachedCircuit failed', err);
-  }
-}
-
-export async function ensureCachedSessionMeta(params: {
-  sessionKey: number;
-  year: number;
-  round: number;
-  sessionType: string;
-  sessionName: string;
-  circuitId: string;
-}): Promise<void> {
-  if (!supabase) return;
-  try {
-    await supabase.from('cached_sessions').upsert({
-      session_key: params.sessionKey,
-      year: params.year,
-      round: params.round,
-      session_type: params.sessionType,
-      session_name: params.sessionName,
-      circuit_id: params.circuitId
-    });
-  } catch (err) {
-    console.warn('Supabase ensureCachedSessionMeta failed', err);
-  }
+  await safeFetch<{ ok: boolean }>(
+    '/api/cache/circuit',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ circuitId: circuit.id, data: circuit })
+    }
+  );
 }
