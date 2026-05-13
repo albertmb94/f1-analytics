@@ -5,6 +5,44 @@ export interface TeamMetrics {
   downforce: number;
   drag: number;
   tireManagement: number;
+  braking: number;
+}
+
+// 2026 F1 abolished DRS and introduced universal active aerodynamics with two
+// modes (X = low drag for straights, Z = high downforce for corners). Anywhere
+// the codebase branches on regulations, gate on this helper rather than
+// hard-coding 2026 so future regulation changes only need one edit.
+export function isModernRegulations(year: number): boolean {
+  return year >= 2026;
+}
+
+export interface AeroModeShare {
+  xMode: number; // fraction of telemetry samples in X-mode (low-drag, straight-line)
+  zMode: number; // fraction of telemetry samples in Z-mode (high-downforce, corner)
+  transitional: number;
+  sampleCount: number;
+}
+
+// Heuristic mode classifier from telemetry. Real 2026 cars expose mode via a
+// separate channel that OpenF1 does not yet ship, so we infer it from speed,
+// RPM and throttle envelope. Tunable but kept conservative — calls between
+// regimes should always sum to 1 across xMode + zMode + transitional.
+export function computeAeroModeShare(telemetry: TelemetryPoint[]): AeroModeShare {
+  if (telemetry.length === 0) return { xMode: 0, zMode: 0, transitional: 0, sampleCount: 0 };
+  let x = 0;
+  let z = 0;
+  let transitional = 0;
+  for (const p of telemetry) {
+    const fullThrottle = p.throttle > 0.95;
+    const highRpm = p.rpm > 9000;
+    const highSpeed = p.speed > 250;
+    const cornering = p.throttle < 0.7 && p.speed < 220 && p.brake < 0.3;
+    if (fullThrottle && highRpm && highSpeed) x += 1;
+    else if (cornering) z += 1;
+    else transitional += 1;
+  }
+  const n = telemetry.length;
+  return { xMode: x / n, zMode: z / n, transitional: transitional / n, sampleCount: n };
 }
 
 export interface TeamPace {
@@ -52,46 +90,146 @@ export function computeTopSpeed(telemetry: TelemetryPoint[]): number {
   return max;
 }
 
-// Average speed in apex windows: low average speed at apex implies the car is slowing more
-// (less aero grip), so we invert: higher apex speed → higher downforce proxy.
-// Returns null when the telemetry does not contain an apex window — we never want a 0
-// to contaminate the team average (a 0 would mean "least downforce" instead of "no data").
-export function computeDownforceProxy(telemetry: TelemetryPoint[]): number | null {
-  if (telemetry.length === 0) return null;
-  const apexSamples = telemetry.filter(p => p.brake > 0.1 || p.throttle < 0.5);
-  if (apexSamples.length === 0) return null;
-  const sum = apexSamples.reduce((s, p) => s + p.speed, 0);
-  return sum / apexSamples.length;
+// Estimated lateral turn rate (rad/s) at sample i, using a centred difference
+// of heading between samples (i-1, i) and (i, i+1). Returns 0 when geometry
+// can't be derived (degenerate spacing, missing coordinates). Used to detect
+// whether the car is still rotating while accelerating / braking, which lets
+// the proxies distinguish a corner phase from a pure straight.
+function turnRateRadPerSec(prev: TelemetryPoint, cur: TelemetryPoint, next: TelemetryPoint): number {
+  const dx1 = cur.x - prev.x;
+  const dy1 = cur.y - prev.y;
+  const dx2 = next.x - cur.x;
+  const dy2 = next.y - cur.y;
+  const len1 = Math.hypot(dx1, dy1);
+  const len2 = Math.hypot(dx2, dy2);
+  if (len1 < 0.1 || len2 < 0.1) return 0;
+  const cross = dx1 * dy2 - dy1 * dx2;
+  const dot = dx1 * dx2 + dy1 * dy2;
+  const angle = Math.atan2(cross, dot);
+  const dt = next.time - prev.time;
+  return dt > 0 ? Math.abs(angle) / dt : 0;
 }
 
-// Traction: average rate of speed gain (km/h per second) under full throttle, below top speed.
+// Downforce proxy — average speed at mid-corner. Filters samples where the
+// driver is rolling on neither pedal hard (throttle in [0.2, 0.8], brake low)
+// and demands sustained occurrence (≥3 samples), so the entry-of-corner braking
+// phase no longer leaks in and depresses cars with aggressive trail-braking.
+// In 2026 this measures Z-mode effectiveness more than chassis aero alone, but
+// the ranking interpretation is unchanged.
+export function computeDownforceProxy(telemetry: TelemetryPoint[]): number | null {
+  if (telemetry.length < 3) return null;
+  const speeds: number[] = [];
+  let streak = 0;
+  let streakSum = 0;
+  for (const p of telemetry) {
+    const midCorner = p.throttle >= 0.2 && p.throttle <= 0.8 && p.brake < 0.1;
+    if (midCorner) {
+      streak += 1;
+      streakSum += p.speed;
+    } else {
+      if (streak >= 3) speeds.push(streakSum / streak);
+      streak = 0;
+      streakSum = 0;
+    }
+  }
+  if (streak >= 3) speeds.push(streakSum / streak);
+  if (speeds.length === 0) return null;
+  return speeds.reduce((s, v) => s + v, 0) / speeds.length;
+}
+
+// Traction proxy — average longitudinal acceleration (km/h per second) at
+// corner exit. Demands full throttle AND the car still rotating (turn rate
+// above ~0.05 rad/s) so a pure straight-line dragstrip-style burst (where
+// power and drag dominate, not mechanical grip) is not counted. Falls back
+// to "any full-throttle accel" when the telemetry lacks usable x/y geometry.
 export function computeTractionProxy(telemetry: TelemetryPoint[]): number | null {
-  if (telemetry.length < 2) return null;
+  if (telemetry.length < 3) return null;
+  const TURN_THRESHOLD = 0.05;
+  let hasGeometry = false;
+  for (const p of telemetry) {
+    if (p.x !== 0 || p.y !== 0) { hasGeometry = true; break; }
+  }
   const deltas: number[] = [];
-  for (let i = 1; i < telemetry.length; i++) {
+  for (let i = 1; i < telemetry.length - 1; i++) {
     const prev = telemetry[i - 1];
     const cur = telemetry[i];
+    const next = telemetry[i + 1];
     const dt = cur.time - prev.time;
     if (dt <= 0 || dt > 1) continue;
-    if (prev.throttle > 0.9 && cur.speed > prev.speed && cur.speed < 320) {
-      deltas.push((cur.speed - prev.speed) / dt);
+    if (!(prev.throttle > 0.9 && cur.speed > prev.speed && cur.speed < 320)) continue;
+    if (hasGeometry) {
+      const omega = turnRateRadPerSec(prev, cur, next);
+      if (omega < TURN_THRESHOLD) continue;
     }
+    deltas.push((cur.speed - prev.speed) / dt);
   }
   if (deltas.length === 0) return null;
   return deltas.reduce((s, v) => s + v, 0) / deltas.length;
 }
 
-// Drag proxy: top speed in long high-RPM stretches. Higher top speed ≈ less drag.
+// Drag proxy — 95th percentile of speed during sustained full-throttle stints
+// (≥4 seconds, throttle>0.95). Switching from "absolute max" to P95 of long
+// stints kills the single-outlier failure mode (slipstream gust or sensor
+// spike) while keeping the metric responsive to the team's actual X-mode top
+// speed. Higher value = less drag.
 export function computeDragProxy(telemetry: TelemetryPoint[]): number | null {
   if (telemetry.length === 0) return null;
-  const fullThrottle = telemetry.filter(p => p.throttle > 0.95 && p.rpm > 9000);
-  if (fullThrottle.length === 0) return null;
-  const top = fullThrottle.reduce((m, p) => Math.max(m, p.speed), 0);
-  return top;
+  const stints: number[][] = [];
+  let cur: TelemetryPoint[] = [];
+  for (const p of telemetry) {
+    if (p.throttle > 0.95 && p.rpm > 9000) {
+      cur.push(p);
+    } else {
+      if (cur.length > 0) {
+        const dur = cur[cur.length - 1].time - cur[0].time;
+        if (dur >= 4) stints.push(cur.map(x => x.speed));
+        cur = [];
+      }
+    }
+  }
+  if (cur.length > 0) {
+    const dur = cur[cur.length - 1].time - cur[0].time;
+    if (dur >= 4) stints.push(cur.map(x => x.speed));
+  }
+  if (stints.length === 0) return null;
+  const p95s = stints.map(speeds => quantile(speeds, 0.95));
+  return p95s.reduce((s, v) => s + v, 0) / p95s.length;
 }
 
-// Tire management: slope of fuel-corrected lap time vs tire age (per compound, then averaged).
-// Lower (less degradation) is better — return -slope so higher score = better tire management.
+// Braking proxy — peak deceleration in heavy braking events. For each
+// continuous brake>0.9 segment, take the strongest Δspeed/Δtime decrease.
+// Average across segments and return the magnitude. Used by the simulator
+// to compute a *real* braking penalty instead of substituting traction.
+export function computeBrakingProxy(telemetry: TelemetryPoint[]): number | null {
+  if (telemetry.length < 2) return null;
+  const peaks: number[] = [];
+  let segmentPeak = 0;
+  let inBrake = false;
+  for (let i = 1; i < telemetry.length; i++) {
+    const prev = telemetry[i - 1];
+    const cur = telemetry[i];
+    const dt = cur.time - prev.time;
+    const heavy = prev.brake > 0.9 && cur.brake > 0.9;
+    if (heavy && dt > 0 && dt < 1) {
+      const decel = (prev.speed - cur.speed) / dt; // km/h per s, positive when slowing
+      if (decel > segmentPeak) segmentPeak = decel;
+      inBrake = true;
+    } else if (inBrake) {
+      if (segmentPeak > 0) peaks.push(segmentPeak);
+      segmentPeak = 0;
+      inBrake = false;
+    }
+  }
+  if (inBrake && segmentPeak > 0) peaks.push(segmentPeak);
+  if (peaks.length === 0) return null;
+  return peaks.reduce((s, v) => s + v, 0) / peaks.length;
+}
+
+// Tire management — sample-weighted average of per-compound degradation slope.
+// For each compound the team ran, regress fuel-corrected lap time on tire age,
+// drop laps more than 2σ from the compound's median (in/out laps, traffic),
+// then weight the slope by surviving sample size so 3 Soft laps no longer
+// count the same as 12 Hard laps. Returns -slope so higher = better tire mgmt.
 export function computeTireManagement(laps: Lap[]): number {
   const clean = laps.filter(isCleanLap);
   if (clean.length < 3) return 0;
@@ -101,11 +239,21 @@ export function computeTireManagement(laps: Lap[]): number {
     arr.push(l);
     byCompound.set(l.tireCompound, arr);
   });
-  const slopes: number[] = [];
+
+  let weightedSum = 0;
+  let weightTotal = 0;
   byCompound.forEach(group => {
     if (group.length < 3) return;
-    const xs = group.map(l => l.tireAge);
-    const ys = group.map(l => l.fuelCorrectedTime);
+    const times = group.map(l => l.fuelCorrectedTime);
+    const med = median(times);
+    const sigma = stdDev(times);
+    const filtered = sigma > 0
+      ? group.filter(l => Math.abs(l.fuelCorrectedTime - med) <= 2 * sigma)
+      : group;
+    if (filtered.length < 3) return;
+
+    const xs = filtered.map(l => l.tireAge);
+    const ys = filtered.map(l => l.fuelCorrectedTime);
     const n = xs.length;
     const meanX = xs.reduce((s, v) => s + v, 0) / n;
     const meanY = ys.reduce((s, v) => s + v, 0) / n;
@@ -115,11 +263,14 @@ export function computeTireManagement(laps: Lap[]): number {
       num += (xs[i] - meanX) * (ys[i] - meanY);
       den += (xs[i] - meanX) ** 2;
     }
-    if (den > 0) slopes.push(num / den);
+    if (den <= 0) return;
+    const slope = num / den;
+    weightedSum += slope * n;
+    weightTotal += n;
   });
-  if (slopes.length === 0) return 0;
-  const avgSlope = slopes.reduce((s, v) => s + v, 0) / slopes.length;
-  return -avgSlope;
+
+  if (weightTotal === 0) return 0;
+  return -(weightedSum / weightTotal);
 }
 
 export function computeDriverTeamPace(laps: Lap[]): TeamPace | null {
@@ -128,25 +279,49 @@ export function computeDriverTeamPace(laps: Lap[]): TeamPace | null {
   return { median: median(clean), stdDev: stdDev(clean), sampleSize: clean.length };
 }
 
-// Normalize within the bounded range [lo, hi] — never produces absolute 0% or 100%,
-// which would suggest a team has "no skill at all" when the score is purely relative.
+// Percentile-rank normalization — each team gets a score equal to its rank
+// quantile within the grid, scaled into [lo, hi]. Robust to outliers (one
+// freakishly fast team no longer compresses the rest) and stable across
+// sessions: "85" always means "top 15% of cars present" rather than "85% of
+// the linear range between min and max", which changed each time a slow car
+// dropped out of the pool. NaN inputs land at the mid-range and tie-break
+// by averaging ranks.
 function normalize(map: Map<string, number>, lo = 25, hi = 95): Map<string, number> {
-  const values = Array.from(map.values()).filter(v => Number.isFinite(v));
-  if (values.length === 0) return new Map();
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = max - min;
+  const entries = Array.from(map.entries());
   const out = new Map<string, number>();
-  if (span < 1e-6) {
-    map.forEach((_, k) => out.set(k, (lo + hi) / 2));
+  if (entries.length === 0) return out;
+
+  const finiteEntries = entries.filter(([, v]) => Number.isFinite(v));
+  if (finiteEntries.length === 0) {
+    entries.forEach(([k]) => out.set(k, (lo + hi) / 2));
     return out;
   }
-  map.forEach((v, k) => {
+  if (finiteEntries.length === 1) {
+    entries.forEach(([k, v]) => out.set(k, Number.isFinite(v) ? (lo + hi) / 2 : (lo + hi) / 2));
+    return out;
+  }
+
+  // Sort by value ascending, then assign average rank for ties.
+  const sorted = [...finiteEntries].sort(([, a], [, b]) => a - b);
+  const rankByTeam = new Map<string, number>();
+  let i = 0;
+  while (i < sorted.length) {
+    let j = i;
+    while (j + 1 < sorted.length && sorted[j + 1][1] === sorted[i][1]) j += 1;
+    const avgRank = (i + j) / 2; // 0-indexed average rank for the tie block
+    for (let k = i; k <= j; k++) rankByTeam.set(sorted[k][0], avgRank);
+    i = j + 1;
+  }
+  const denom = sorted.length - 1;
+
+  entries.forEach(([k, v]) => {
     if (!Number.isFinite(v)) {
       out.set(k, (lo + hi) / 2);
       return;
     }
-    out.set(k, lo + ((v - min) / span) * (hi - lo));
+    const rank = rankByTeam.get(k) ?? 0;
+    const q = denom > 0 ? rank / denom : 0.5;
+    out.set(k, lo + q * (hi - lo));
   });
   return out;
 }
@@ -157,6 +332,7 @@ export interface TeamRawSignals {
   tractionRaw: number;
   dragRaw: number;
   tireRaw: number;
+  brakingRaw: number;
   driversWithData: number;
 }
 
@@ -180,6 +356,7 @@ export function aggregateRawSignals(input: TeamAggregateInput): TeamRawSignals |
   const tractions: number[] = [];
   const drags: number[] = [];
   const tires: number[] = [];
+  const brakes: number[] = [];
 
   driversWithTelemetry.forEach(d => {
     if (d.telemetry.length > 0) {
@@ -191,6 +368,8 @@ export function aggregateRawSignals(input: TeamAggregateInput): TeamRawSignals |
       if (tr != null) tractions.push(tr);
       const dr = computeDragProxy(d.telemetry);
       if (dr != null) drags.push(dr);
+      const br = computeBrakingProxy(d.telemetry);
+      if (br != null) brakes.push(br);
     }
     if (d.laps.length > 0) {
       const tire = computeTireManagement(d.laps);
@@ -206,6 +385,7 @@ export function aggregateRawSignals(input: TeamAggregateInput): TeamRawSignals |
     tractionRaw: avgOrNaN(tractions),
     dragRaw: avgOrNaN(drags),
     tireRaw: avgOrNaN(tires),
+    brakingRaw: avgOrNaN(brakes),
     driversWithData: driversWithTelemetry.length
   };
 }
@@ -223,21 +403,25 @@ export function aggregateTeamMetrics(inputs: TeamAggregateInput[]): Map<string, 
   const tracMap = new Map<string, number>();
   const dragMap = new Map<string, number>();
   const tireMap = new Map<string, number>();
+  const brakeMap = new Map<string, number>();
 
   raw.forEach((s, team) => {
     downMap.set(team, s.downforceRaw);
     tracMap.set(team, s.tractionRaw);
     dragMap.set(team, s.dragRaw);
     tireMap.set(team, s.tireRaw);
+    brakeMap.set(team, s.brakingRaw);
   });
 
   const downNorm = normalize(downMap);
   const tracNorm = normalize(tracMap);
-  // Drag is "less is better": invert raw top speed normalization
+  // Drag is "less is better": invert raw top-speed normalization so a high
+  // top-speed team gets a high score on the "low drag" axis.
   const dragNormRaw = normalize(dragMap);
   const dragNorm = new Map<string, number>();
   dragNormRaw.forEach((v, k) => dragNorm.set(k, 100 - v));
   const tireNorm = normalize(tireMap);
+  const brakeNorm = normalize(brakeMap);
 
   const out = new Map<string, TeamMetrics>();
   raw.forEach((_s, team) => {
@@ -245,7 +429,8 @@ export function aggregateTeamMetrics(inputs: TeamAggregateInput[]): Map<string, 
       traction: tracNorm.get(team) ?? 50,
       downforce: downNorm.get(team) ?? 50,
       drag: dragNorm.get(team) ?? 50,
-      tireManagement: tireNorm.get(team) ?? 50
+      tireManagement: tireNorm.get(team) ?? 50,
+      braking: brakeNorm.get(team) ?? 50
     });
   });
   return out;
@@ -366,10 +551,11 @@ export function computeDriverIdealMap(
   return map;
 }
 
-// Variance estimator for the simulator that does NOT depend on isCleanAir.
-// We take the team's combined laps, exclude in/out laps via a time gate,
-// keep only the faster half (the ones a driver would actually attempt at the limit),
-// and bound the resulting stdDev to a per-session-type range.
+// Variance estimator (legacy) — kept as a fallback for teams with too few
+// laps to bootstrap properly. The simulator's primary path now uses
+// computeRaceableLapPool + sampleCenteredLap below, which preserves the
+// actual shape of the team's lap-time distribution instead of squashing it
+// into a bounded Gaussian.
 export type SessionTypeLite = 'FP1' | 'FP2' | 'FP3' | 'Q' | 'R' | 'S' | 'SQ';
 
 export function computeIdealVariance(laps: Lap[], sessionType: SessionTypeLite): number {
@@ -384,6 +570,91 @@ export function computeIdealVariance(laps: Lap[], sessionType: SessionTypeLite):
   const fast = sorted.slice(0, Math.max(3, Math.ceil(sorted.length / 2)));
   const sigma = stdDev(fast);
   return Math.max(floor, Math.min(ceiling, sigma));
+}
+
+// Returns the team's "raceable" lap-time pool: valid laps minus the team's
+// teamIdeal, so each entry is a (signed) deviation from the team's theoretical
+// best. Bootstrap-sampled in the simulator to inject realistic noise that
+// matches the team's own variability, including asymmetry and heavy tails.
+export function computeRaceableLapPool(laps: Lap[], teamIdeal: number): number[] {
+  const eligible = laps
+    .map(l => l.time)
+    .filter(t => Number.isFinite(t) && t > 60 && t < 200);
+  if (eligible.length === 0) return [];
+  // Trim the slowest tail (top ~10%) — in/out laps and traffic deltas would
+  // otherwise dominate. Keep the realistic chunk a driver would attempt.
+  const sorted = [...eligible].sort((a, b) => a - b);
+  const cut = Math.max(3, Math.floor(sorted.length * 0.9));
+  return sorted.slice(0, cut).map(t => t - teamIdeal);
+}
+
+// Standard Normal sampling via Box-Muller. Used for sub-lap noise floor when
+// a team has too few laps to bootstrap reliably.
+export function boxMullerGaussian(stddev: number): number {
+  const u1 = Math.max(Math.random(), 1e-12);
+  const u2 = Math.random();
+  return stddev * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
+// Sample a single centered lap from the team pool. Falls back to Gaussian
+// when the pool is empty (cold-start teams or thin sessions).
+export function sampleCenteredLap(pool: number[], fallbackSigma: number): number {
+  if (pool.length === 0) return boxMullerGaussian(fallbackSigma);
+  const idx = Math.floor(Math.random() * pool.length);
+  return pool[idx];
+}
+
+// Session-type-aware topology weights. Race weight on tirePenalty is much
+// higher than Q because degradation drives a 50+ lap stint. Pole-style
+// sessions reward outright lap potential, so topSpeedPenalty and downforce
+// dominate.
+export interface TopologyWeights {
+  downforce: number;
+  topSpeed: number;
+  tire: number;
+  braking: number;
+}
+
+export function topologyWeights(sessionType: SessionTypeLite): TopologyWeights {
+  const isRace = sessionType === 'R' || sessionType === 'S';
+  if (isRace) {
+    // Race: tire wear and braking energy carry the long stint; downforce still
+    // matters but less than in qualifying-style single-lap pushes.
+    return { downforce: 0.25, topSpeed: 0.20, tire: 0.40, braking: 0.15 };
+  }
+  // Q / SQ / FP: outright single-lap pace.
+  return { downforce: 0.40, topSpeed: 0.30, tire: 0.05, braking: 0.25 };
+}
+
+// 2026 mode-fit penalty — compares the team's measured X-mode vs Z-mode
+// usage share to what the circuit profile implies the optimal split should
+// be. A team that runs X-mode rarely on Monza (high topSpeedImportance)
+// gets penalised; a team that under-uses Z-mode on Hungaroring (high
+// downforceReq) gets penalised too. Returns a non-negative penalty in the
+// same lap-time-seconds unit as the rest of the topology calculation.
+export interface CircuitAeroProfile {
+  downforceReq: number;
+  topSpeedImportance: number;
+}
+
+export function computeModeFitPenalty(
+  teamShare: AeroModeShare,
+  profile: CircuitAeroProfile
+): number {
+  if (teamShare.sampleCount === 0) return 0;
+  const totalImportance = profile.downforceReq + profile.topSpeedImportance;
+  if (totalImportance <= 0) return 0;
+  const expectedX = profile.topSpeedImportance / totalImportance;
+  const expectedZ = profile.downforceReq / totalImportance;
+  // Renormalise the team's mode share to ignore transitional time so the
+  // comparison is apples-to-apples.
+  const used = teamShare.xMode + teamShare.zMode;
+  if (used < 1e-6) return 0;
+  const actualX = teamShare.xMode / used;
+  const actualZ = teamShare.zMode / used;
+  // L1 distance, scaled so a fully-misaligned setup costs ~0.4s (sub-Q-variance
+  // scale, intentionally smaller than the chassis topology penalty).
+  return (Math.abs(actualX - expectedX) + Math.abs(actualZ - expectedZ)) * 0.2;
 }
 
 // Ranks teams by their best driver's ideal lap (or best real lap as fallback).

@@ -84,6 +84,7 @@ export interface Team {
     downforce: number;
     drag: number;
     tireManagement: number;
+    braking?: number;
   };
 }
 

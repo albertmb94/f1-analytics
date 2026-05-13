@@ -147,8 +147,18 @@ const MLAnalysis: React.FC = () => {
     return buildInsights(teamsToUse, driversToUse, downloadedData.laps);
   }, [availableTeams, resolvedDownloadDrivers, downloadedData, idealRanking]);
 
-  const teamCharacteristics = (team: import('../types/f1').Team): TeamMetrics =>
-    realTeamData?.characteristics.get(team.name) ?? team.characteristics;
+  const teamCharacteristics = (team: import('../types/f1').Team): TeamMetrics => {
+    const real = realTeamData?.characteristics.get(team.name);
+    if (real) return real;
+    const fallback = team.characteristics;
+    return {
+      traction: fallback.traction,
+      downforce: fallback.downforce,
+      drag: fallback.drag,
+      tireManagement: fallback.tireManagement,
+      braking: fallback.braking ?? 50
+    };
+  };
 
   const teamIdealEntry = (team: import('../types/f1').Team): TeamIdealEntry | undefined =>
     idealRanking.find(e => e.team === team.name);

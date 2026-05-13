@@ -7,10 +7,17 @@ import {
   computeTeamIdealRanking,
   computeDriverIdealMap,
   computeIdealVariance,
+  computeAeroModeShare,
+  computeRaceableLapPool,
+  sampleCenteredLap,
+  topologyWeights,
+  computeModeFitPenalty,
+  isModernRegulations,
   quantile,
   type TeamMetrics,
   type TeamIdealEntry,
-  type SessionTypeLite
+  type SessionTypeLite,
+  type AeroModeShare
 } from '../lib/teamMetrics';
 import { filterDatasetByActiveSessions } from '../lib/activeDataset';
 import {
@@ -102,6 +109,22 @@ const PredictiveSimulator: React.FC = () => {
       teamLaps.set(d.team, arr);
     });
 
+    // Per-driver lap count, for weighting driverAdjustment in the simulator
+    // so a 3-lap teammate doesn't carry the same weight as a 25-lap one.
+    const driverLapCount = new Map<string, number>();
+    driverEntries.forEach(d => {
+      driverLapCount.set(d.driverId, d.laps.length);
+    });
+
+    // Per-team aero-mode share (X-mode vs Z-mode). Derived from telemetry;
+    // empty teams (no telemetry yet) get zero shares and are simply not
+    // penalised by the mode-fit term.
+    const aeroModeShare = new Map<string, AeroModeShare>();
+    driversByTeam.forEach((teamDrivers, team) => {
+      const merged = teamDrivers.flatMap(d => d.telemetry);
+      aeroModeShare.set(team, computeAeroModeShare(merged));
+    });
+
     // Track which teams have only some of their expected drivers loaded
     const expectedByTeam = new Map<string, number>();
     downloaded.drivers.forEach(d => {
@@ -113,7 +136,7 @@ const PredictiveSimulator: React.FC = () => {
       if (loaded.length < expected) partial.set(team, { loaded: loaded.length, expected });
     });
 
-    return { characteristics, pace, driverPace, idealRanking, driverIdeal, teamLaps, partial };
+    return { characteristics, pace, driverPace, idealRanking, driverIdeal, teamLaps, driverLapCount, aeroModeShare, partial };
   }, [downloaded.laps, downloaded.telemetry, downloaded.drivers]);
 
   const realTeamPace = realTeamData?.pace ?? null;
@@ -121,6 +144,8 @@ const PredictiveSimulator: React.FC = () => {
   const realIdealRanking = realTeamData?.idealRanking ?? null;
   const realDriverIdeal = realTeamData?.driverIdeal ?? null;
   const realTeamLaps = realTeamData?.teamLaps ?? null;
+  const realDriverLapCount = realTeamData?.driverLapCount ?? null;
+  const realAeroModeShare = realTeamData?.aeroModeShare ?? null;
   const partialTeams = realTeamData?.partial ?? null;
 
   const circuitOptions = useMemo(() => {
@@ -154,12 +179,23 @@ const PredictiveSimulator: React.FC = () => {
     }
   }, [circuitOptions, selectedCircuit]);
 
-  const calculateTopologyMismatch = (chars: TeamMetrics, selectedTrack: Circuit) => {
+  const calculateTopologyMismatch = (chars: TeamMetrics, selectedTrack: Circuit, sessionType: SessionTypeLite) => {
+    // Session-type-aware weights so the mismatch reflects what actually limits
+    // pace at that stage of a race weekend (tire wear dominates a race stint,
+    // braking + downforce dominate a Q lap).
+    const w = topologyWeights(sessionType);
     const downforcePenalty = Math.abs(chars.downforce - selectedTrack.profile.downforceReq) / 100;
     const topSpeedPenalty = Math.abs((100 - chars.drag) - selectedTrack.profile.topSpeedImportance) / 100;
     const tirePenalty = Math.max(0, selectedTrack.profile.tireWear - chars.tireManagement) / 100;
-    const brakingPenalty = Math.max(0, selectedTrack.profile.brakingEnergy - chars.traction) / 120;
-    return (downforcePenalty * 0.35 + topSpeedPenalty * 0.3 + tirePenalty * 0.2 + brakingPenalty * 0.15) * 1.8;
+    // Real braking proxy (not traction substitute). Penalises only when the
+    // circuit's braking demand exceeds the team's measured braking capacity.
+    const brakingPenalty = Math.max(0, selectedTrack.profile.brakingEnergy - chars.braking) / 100;
+    return (
+      downforcePenalty * w.downforce
+      + topSpeedPenalty * w.topSpeed
+      + tirePenalty * w.tire
+      + brakingPenalty * w.braking
+    ) * 1.8;
   };
 
   // Teams that lack real telemetry are excluded from the simulator: we don't synthesize a basePace.
@@ -183,43 +219,80 @@ const PredictiveSimulator: React.FC = () => {
     return (q?.sessionType ?? sq?.sessionType ?? r?.sessionType ?? sessions[0]?.sessionType ?? 'Q') as SessionTypeLite;
   }, [circuit, downloaded.sessions]);
 
+  // Most recent year among the sessions backing this circuit. Used to gate
+  // 2026-specific math (mode-fit penalty) without affecting earlier seasons.
+  const activeSessionYear: number = useMemo(() => {
+    if (!circuit) return new Date().getUTCFullYear();
+    const sessions = downloaded.sessions.filter(s => s.circuit === circuit.id);
+    if (sessions.length === 0) return new Date().getUTCFullYear();
+    return Math.max(...sessions.map(s => s.year));
+  }, [circuit, downloaded.sessions]);
+
   const runMonteCarlo = (selectedTrack: Circuit, teamsToSimulate: Team[], driversToSimulate: Driver[]): SimulationResult[] => {
     if (!realIdealRanking || !realCharacteristics || !realTeamLaps || teamsToSimulate.length === 0) return [];
     const simulations = 10000;
     const isRace = activeSessionType === 'R' || activeSessionType === 'S';
     const topologyFactor = isRace ? 1.0 : 0.3; // Q ideals already encode circuit affinity
+    const modernEra = isModernRegulations(activeSessionYear);
 
     const entries = teamsToSimulate
       .map(team => {
         const idealEntry = realIdealRanking.get(team.name);
         if (!idealEntry) return null;
-        const chars = realCharacteristics.get(team.name) ?? { traction: 50, downforce: 50, drag: 50, tireManagement: 50 };
+        const chars = realCharacteristics.get(team.name) ?? { traction: 50, downforce: 50, drag: 50, tireManagement: 50, braking: 50 };
         const teamDrivers = driversToSimulate.filter(driver => driver.team === team.name);
-        // Driver adjustment: each driver's ideal lap minus team's best ideal lap.
-        // The team-best driver yields adjustment 0; slower team-mates push the average upward.
         const teamIdeal = idealEntry.idealLap;
-        const adjustments = teamDrivers
-          .map(d => realDriverIdeal?.get(d.id))
-          .filter((v): v is number => typeof v === 'number')
-          .map(v => v - teamIdeal);
-        const adjustment = adjustments.length > 0
-          ? adjustments.reduce((s, v) => s + v, 0) / adjustments.length
+
+        // Lap-weighted driver adjustment. Each team-mate's "best lap minus
+        // team's theoretical best" is weighted by their lap count, so a fast
+        // outlier driven across only 3 laps doesn't drag the team's expected
+        // performance as if they had run the whole session.
+        let adjustmentNumerator = 0;
+        let adjustmentDenominator = 0;
+        teamDrivers.forEach(d => {
+          const ideal = realDriverIdeal?.get(d.id);
+          if (typeof ideal !== 'number') return;
+          const w = realDriverLapCount?.get(d.id) ?? 1;
+          adjustmentNumerator += (ideal - teamIdeal) * w;
+          adjustmentDenominator += w;
+        });
+        const adjustment = adjustmentDenominator > 0
+          ? adjustmentNumerator / adjustmentDenominator
           : 0;
+
         const teamLaps = realTeamLaps.get(team.name) ?? [];
-        const variance = computeIdealVariance(teamLaps, activeSessionType);
-        return { team, effectivePace: teamIdeal, variance, chars, driverAdjustment: adjustment };
+        // Bootstrap pool: real centered lap times. When too thin, fall back
+        // to the legacy Gaussian-bounded variance so cold-start teams still
+        // get plausible spread.
+        const centeredPool = computeRaceableLapPool(teamLaps, teamIdeal);
+        const fallbackSigma = computeIdealVariance(teamLaps, activeSessionType);
+        const modeShare = realAeroModeShare?.get(team.name);
+        return {
+          team,
+          effectivePace: teamIdeal,
+          centeredPool,
+          fallbackSigma,
+          chars,
+          modeShare,
+          driverAdjustment: adjustment
+        };
       })
       .filter((e): e is NonNullable<typeof e> => e !== null);
 
     if (entries.length === 0) return [];
 
-    const paceSamples = entries.map(({ team, effectivePace, variance, chars, driverAdjustment: adjustment }) => {
-      const topologyPenalty = calculateTopologyMismatch(chars, selectedTrack) * topologyFactor;
+    const paceSamples = entries.map(({ team, effectivePace, centeredPool, fallbackSigma, chars, modeShare, driverAdjustment: adjustment }) => {
+      const topologyPenalty = calculateTopologyMismatch(chars, selectedTrack, activeSessionType) * topologyFactor;
+      // 2026 mode-fit penalty: how well the team's measured X/Z usage matches
+      // the track profile. Skipped pre-2026 (no active aero / no mode signal).
+      const modePenalty = modernEra && modeShare
+        ? computeModeFitPenalty(modeShare, selectedTrack.profile)
+        : 0;
       const samples = Array.from({ length: simulations }, () => {
-        // Box-Muller-ish: average two uniforms to approximate normal-like noise scaled by variance.
-        const noise = ((Math.random() + Math.random() + Math.random() + Math.random()) / 4 - 0.5) * 2;
-        const stochastic = noise * variance * weatherFactor;
-        return effectivePace + topologyPenalty + adjustment + stochastic;
+        // Real bootstrap noise: resample a centered lap from this team's own
+        // distribution. Captures asymmetric and heavy-tailed variability.
+        const stochastic = sampleCenteredLap(centeredPool, fallbackSigma) * weatherFactor;
+        return effectivePace + topologyPenalty + modePenalty + adjustment + stochastic;
       });
       return { team, samples };
     });
