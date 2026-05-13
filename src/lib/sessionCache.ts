@@ -11,6 +11,15 @@ export interface CachedDriverDataset {
   laps: Lap[];
 }
 
+export interface CachedSessionMeta {
+  sessionKey: number;
+  year: number;
+  round: number;
+  sessionType: string;
+  sessionName: string;
+  circuitId: string;
+}
+
 // Cache the result of "is the cache backend reachable?" so we don't issue dozens
 // of failed requests when running locally without Turso configured.
 let cacheDisabled = false;
@@ -29,6 +38,11 @@ async function safeFetch<T>(url: string, init?: RequestInit): Promise<T | null> 
   } catch {
     return null;
   }
+}
+
+export async function loadCachedSessions(): Promise<CachedSessionMeta[] | null> {
+  const r = await safeFetch<{ sessions: CachedSessionMeta[] }>('/api/cache/sessions');
+  return r?.sessions ?? null;
 }
 
 export async function loadCachedDriverSession(
