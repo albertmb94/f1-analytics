@@ -1,4 +1,4 @@
-import type { Lap, TelemetryPoint } from '../types/f1';
+import type { Lap, TelemetryPoint, Circuit } from '../types/f1';
 
 export interface TeamMetrics {
   traction: number;
@@ -848,4 +848,38 @@ export function computeTeamIdealRanking(
     entries.forEach(e => { e.deltaToPole = e.idealLap - pole; });
   }
   return entries;
+}
+
+// ─── Circuit base time and topology mismatch (reusable across components) ─────
+
+export function calculateTopologyMismatch(
+  chars: TeamMetrics,
+  circuit: Circuit,
+  sessionType: SessionTypeLite
+): number {
+  const w = topologyWeights(sessionType);
+  const downforcePenalty = Math.abs(chars.downforce - circuit.profile.downforceReq) / 100;
+  const topSpeedPenalty = Math.abs((100 - chars.drag) - circuit.profile.topSpeedImportance) / 100;
+  const tirePenalty = Math.max(0, circuit.profile.tireWear - chars.tireManagement) / 100;
+  const brakingPenalty = Math.max(0, circuit.profile.brakingEnergy - chars.braking) / 100;
+  return (
+    downforcePenalty * w.downforce
+    + topSpeedPenalty * w.topSpeed
+    + tirePenalty * w.tire
+    + brakingPenalty * w.braking
+  ) * 1.8;
+}
+
+// Estimate the reference lap time for a circuit (seconds) based on its physical
+// characteristics and length. Used to project performance from one circuit to
+// another: instead of using teamIdeal (tied to the source circuit) as the
+// absolute baseline, we start from the target circuit's estimated base time
+// and add team-specific residuals and topology mismatch adjustments.
+export function estimateCircuitBaseTime(
+  profile: { downforceReq: number; topSpeedImportance: number; brakingEnergy: number; lateralG: number },
+  length: number
+): number {
+  const ratio = (profile.topSpeedImportance + 10) / (profile.downforceReq + profile.topSpeedImportance + 20);
+  const avgSpeed = 150 + ratio * 130;
+  return (length / avgSpeed) * 3.6;
 }

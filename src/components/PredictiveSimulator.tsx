@@ -10,13 +10,13 @@ import {
   computeAeroModeShare,
   computeRaceableLapPool,
   sampleCenteredLap,
-  topologyWeights,
   computeModeFitPenalty,
   computeCompoundDegradation,
   simulateRaceStrategies,
   isModernRegulations,
   quantile,
-  type TeamMetrics,
+  calculateTopologyMismatch,
+  estimateCircuitBaseTime,
   type TeamIdealEntry,
   type SessionTypeLite,
   type AeroModeShare,
@@ -192,26 +192,41 @@ const PredictiveSimulator: React.FC = () => {
     }
   }, [circuitOptions, selectedCircuit]);
 
-  const calculateTopologyMismatch = (chars: TeamMetrics, selectedTrack: Circuit, sessionType: SessionTypeLite) => {
-    // Session-type-aware weights so the mismatch reflects what actually limits
-    // pace at that stage of a race weekend (tire wear dominates a race stint,
-    // braking + downforce dominate a Q lap).
-    const w = topologyWeights(sessionType);
-    const downforcePenalty = Math.abs(chars.downforce - selectedTrack.profile.downforceReq) / 100;
-    const topSpeedPenalty = Math.abs((100 - chars.drag) - selectedTrack.profile.topSpeedImportance) / 100;
-    const tirePenalty = Math.max(0, selectedTrack.profile.tireWear - chars.tireManagement) / 100;
-    // Real braking proxy (not traction substitute). Penalises only when the
-    // circuit's braking demand exceeds the team's measured braking capacity.
-    const brakingPenalty = Math.max(0, selectedTrack.profile.brakingEnergy - chars.braking) / 100;
-    return (
-      downforcePenalty * w.downforce
-      + topSpeedPenalty * w.topSpeed
-      + tirePenalty * w.tire
-      + brakingPenalty * w.braking
-    ) * 1.8;
-  };
+  // Source circuit detection: finds the primary circuit with the most downloaded
+  // lap data so we can calibrate absolute lap times and project to any target
+  // circuit using circuitBaseTime + topologyMismatch + teamResidual.
+  const sourceCircuitInfo = useMemo(() => {
+    if (!realIdealRanking || !realCharacteristics || !catalogue?.circuits?.length) return null;
 
-  // Teams that lack real telemetry are excluded from the simulator: we don't synthesize a basePace.
+    const circuitLapCount = new Map<string, number>();
+    Object.entries(downloaded.laps).forEach(([key, laps]) => {
+      const session = downloaded.sessions.find(s =>
+        key.endsWith(`_${s.year}_${s.round}_${s.sessionType}`)
+      );
+      if (session) circuitLapCount.set(session.circuit, (circuitLapCount.get(session.circuit) ?? 0) + laps.length);
+    });
+
+    if (circuitLapCount.size === 0) return null;
+    const primaryId = [...circuitLapCount.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    const sourceCircuit = catalogue.circuits.find(c => c.id === primaryId);
+    if (!sourceCircuit) return null;
+
+    const sourceBaseTime = estimateCircuitBaseTime(sourceCircuit.profile, sourceCircuit.length);
+    const residuals = new Map<string, number>();
+    realIdealRanking.forEach((entry, team) => {
+      const chars = realCharacteristics.get(team);
+      if (!chars) return;
+      const penalty = calculateTopologyMismatch(chars, sourceCircuit, 'Q');
+      residuals.set(team, entry.idealLap - sourceBaseTime - penalty);
+    });
+
+    const circuitBaseTimes = new Map<string, number>();
+    catalogue.circuits.forEach(c => {
+      circuitBaseTimes.set(c.id, estimateCircuitBaseTime(c.profile, c.length));
+    });
+    return { residuals, circuitBaseTimes };
+  }, [catalogue, downloaded.laps, downloaded.sessions, realIdealRanking, realCharacteristics]);
+
   const eligibleTeams = useMemo(() => {
     if (!realIdealRanking) return [] as Team[];
     return teamOptions.filter(t => realIdealRanking.has(t.name));
@@ -296,9 +311,16 @@ const PredictiveSimulator: React.FC = () => {
         const centeredPool = computeRaceableLapPool(teamLaps, teamIdeal);
         const fallbackSigma = computeIdealVariance(teamLaps, activeSessionType);
         const modeShare = realAeroModeShare?.get(team.name);
+        // Instead of using teamIdeal (which is tied to the source circuit) as
+        // the absolute baseline, project to the target circuit via:
+        //   circuitBaseTime[target] + topologyPenalty(target) + teamResidual
+        // When sourceCircuitInfo is unavailable, fall back to teamIdeal.
+        const effectivePace = sourceCircuitInfo
+          ? (sourceCircuitInfo.circuitBaseTimes.get(selectedTrack.id) ?? teamIdeal) + (sourceCircuitInfo.residuals.get(team.name) ?? 0)
+          : teamIdeal;
         return {
           team,
-          effectivePace: teamIdeal,
+          effectivePace,
           centeredPool,
           fallbackSigma,
           chars,
@@ -423,7 +445,10 @@ const PredictiveSimulator: React.FC = () => {
       const medianDelta = centeredPool.length > 0 ? quantile(centeredPool, 0.5) : 0.3;
       const chars = realCharacteristics?.get(t.name) ?? { traction: 50, downforce: 50, drag: 50, tireManagement: 50, braking: 50 };
       const topologyPenalty = calculateTopologyMismatch(chars, circuit, 'R');
-      const baseLapTime = teamIdeal + medianDelta + topologyPenalty;
+      const baseFromCircuit = sourceCircuitInfo
+        ? (sourceCircuitInfo.circuitBaseTimes.get(circuit.id) ?? teamIdeal) + (sourceCircuitInfo.residuals.get(t.name) ?? 0)
+        : teamIdeal;
+      const baseLapTime = baseFromCircuit + medianDelta + topologyPenalty;
       const deg = realCompoundDegradation.get(t.name) ?? new Map<TireCompound, number>();
       const results = simulateRaceStrategies({
         team: t.name,
