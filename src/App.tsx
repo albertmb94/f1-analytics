@@ -6,6 +6,7 @@ import TelemetryProcessing from './components/TelemetryProcessing';
 import MLAnalysis from './components/MLAnalysis';
 import Dashboard from './components/Dashboard';
 import PredictiveSimulator from './components/PredictiveSimulator';
+import UpgradeSimulator from './components/UpgradeSimulator';
 import RawData from './components/RawData';
 import {
   Database,
@@ -14,6 +15,7 @@ import {
   Brain,
   LayoutDashboard,
   Calculator,
+  Gauge,
   Table,
   Settings,
   Bell,
@@ -70,6 +72,13 @@ const modules = [
     description: 'Monte Carlo Forecasting 2026'
   },
   { 
+    id: 'upgrade', 
+    label: 'Upgrades', 
+    icon: Gauge, 
+    color: 'orange',
+    description: 'Performance Upgrade Simulator'
+  },
+  { 
     id: 'rawdata', 
     label: 'Datos Brutos', 
     icon: Table, 
@@ -85,6 +94,7 @@ const colorClasses: Record<string, { bg: string; text: string; border: string; g
   blue: { bg: 'bg-blue-600', text: 'text-blue-400', border: 'border-blue-700', glow: 'shadow-blue-500/20' },
   green: { bg: 'bg-green-600', text: 'text-green-400', border: 'border-green-700', glow: 'shadow-green-500/20' },
   cyan: { bg: 'bg-cyan-600', text: 'text-cyan-400', border: 'border-cyan-700', glow: 'shadow-cyan-500/20' },
+  orange: { bg: 'bg-orange-600', text: 'text-orange-400', border: 'border-orange-700', glow: 'shadow-orange-500/20' },
 };
 
 function App() {
@@ -140,6 +150,8 @@ function App() {
         return <Dashboard />;
       case 'simulator':
         return <PredictiveSimulator />;
+      case 'upgrade':
+        return <UpgradeSimulator />;
       case 'rawdata':
         return <RawData />;
       default:
