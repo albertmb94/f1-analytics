@@ -862,6 +862,10 @@ export function calculateTopologyMismatch(
   const topSpeedPenalty = Math.abs((100 - chars.drag) - circuit.profile.topSpeedImportance) / 100;
   const tirePenalty = Math.max(0, circuit.profile.tireWear - chars.tireManagement) / 100;
   const brakingPenalty = Math.max(0, circuit.profile.brakingEnergy - chars.braking) / 100;
+  // The penalty sum is scaled by 1.8 to convert the 0-1 mismatch fraction into an
+  // approximate lap-time delta (seconds). This factor was empirically calibrated to
+  // reproduce the typical spread between a team's best and worst circuits (~1.5–2.5 s
+  // for a fully mismatched car), and is consistent across both Q and R session types.
   return (
     downforcePenalty * w.downforce
     + topSpeedPenalty * w.topSpeed

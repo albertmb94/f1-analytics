@@ -335,7 +335,7 @@ const DataLoader: React.FC = () => {
                             <div key={evKey} className="border-b border-gray-700/40">
                               <div className="flex items-center gap-3 px-4 py-3 hover:bg-gray-700/30 transition-colors">
                                 {/* Checkbox */}
-                                <button onClick={() => !unavailable && toggleEvent(event)} disabled={unavailable}>
+                                <button onClick={() => !unavailable && toggleEvent(event)} disabled={unavailable} aria-label={evSelected ? `Deseleccionar ${event.eventName}` : `Seleccionar ${event.eventName}`}>
                                   {evSelected
                                     ? <CheckSquare className="w-5 h-5 text-blue-400" />
                                     : <Square className={`w-5 h-5 ${unavailable ? 'text-gray-800' : 'text-gray-600'}`} />}
@@ -357,6 +357,7 @@ const DataLoader: React.FC = () => {
                                 <button
                                   onClick={() => toggleEventExpand(evKey)}
                                   className="text-gray-500 hover:text-white p-1"
+                                  aria-label={expanded ? 'Colapsar sesiones' : 'Expandir sesiones'}
                                 >
                                   {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
                                 </button>
@@ -411,7 +412,7 @@ const DataLoader: React.FC = () => {
                         <div className="flex items-center justify-between px-4 py-3 bg-gray-850">
                           <div className="flex items-center gap-3">
                             {team && (
-                              <button onClick={() => toggleTeam(team)}>
+                              <button onClick={() => toggleTeam(team)} aria-label={teamSel ? `Deseleccionar ${teamName}` : `Seleccionar ${teamName}`}>
                                 {teamSel
                                   ? <CheckSquare className="w-5 h-5 text-purple-400" />
                                   : <Square className="w-5 h-5 text-gray-600" />}

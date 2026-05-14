@@ -1,4 +1,4 @@
-import type { Circuit, Lap, TelemetryPoint } from '../types/f1';
+import type { Lap, TelemetryPoint } from '../types/f1';
 import type { SessionWeatherSummary } from './openf1';
 
 // Thin client over the Vercel serverless functions in `/api/cache/*`.
@@ -38,11 +38,6 @@ async function safeFetch<T>(url: string, init?: RequestInit): Promise<T | null> 
   } catch {
     return null;
   }
-}
-
-export async function loadCachedSessions(): Promise<CachedSessionMeta[] | null> {
-  const r = await safeFetch<{ sessions: CachedSessionMeta[] }>('/api/cache/sessions');
-  return r?.sessions ?? null;
 }
 
 export interface CachedHydrationPayload {
@@ -111,20 +106,3 @@ export async function saveCachedWeather(sessionKey: number, summary: SessionWeat
   );
 }
 
-export async function loadCachedCircuit(circuitId: string): Promise<Circuit | null> {
-  const r = await safeFetch<{ data: Circuit | null }>(
-    `/api/cache/circuit?circuitId=${encodeURIComponent(circuitId)}`
-  );
-  return r?.data ?? null;
-}
-
-export async function saveCachedCircuit(circuit: Circuit): Promise<void> {
-  await safeFetch<{ ok: boolean }>(
-    '/api/cache/circuit',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ circuitId: circuit.id, data: circuit })
-    }
-  );
-}

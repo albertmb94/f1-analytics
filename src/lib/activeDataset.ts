@@ -1,3 +1,5 @@
+import type { Driver, Lap } from '../types/f1';
+
 // The key format used across the app is `${driverId}_${year}_${round}_${sessionType}`.
 // `activeSessionKeys` contains the `${year}_${round}_${sessionType}` suffixes that the
 // user has chosen to keep active. A key whose suffix is not in the set is filtered out.
@@ -20,16 +22,20 @@ export function filterDatasetByActiveSessions<T>(
   return out;
 }
 
-export function filterWeatherByActiveSessions(
-  weather: Record<string, unknown>,
+export function filterDriversByActiveSessions(
+  drivers: Driver[],
+  laps: Record<string, Lap[]>,
   activeSessionKeys: Set<string>
-): typeof weather {
-  if (activeSessionKeys.size === 0) return weather;
-  const out: typeof weather = {};
-  Object.keys(weather).forEach(k => {
-    if (activeSessionKeys.has(k)) out[k] = weather[k];
+): Driver[] {
+  if (activeSessionKeys.size === 0) return drivers;
+  const activeIds = new Set<string>();
+  Object.keys(laps).forEach(key => {
+    if (isActiveDatasetKey(key, activeSessionKeys)) {
+      const driverId = key.split('_')[0];
+      activeIds.add(driverId);
+    }
   });
-  return out;
+  return drivers.filter(d => activeIds.has(d.id));
 }
 
 export function makeSessionKey(year: number, round: number, sessionType: string): string {

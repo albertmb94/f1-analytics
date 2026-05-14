@@ -22,6 +22,13 @@ import {
   loadCachedHydration
 } from '../lib/sessionCache';
 
+function appLog(level: 'warn' | 'error', message: string, ...args: unknown[]): void {
+  if (process.env.NODE_ENV !== 'production') {
+    if (level === 'warn') console.warn(message, ...args);
+    else console.error(message, ...args);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types exposed to the app
 // ─────────────────────────────────────────────────────────────────────────────
@@ -181,7 +188,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const firstYear = 2023;
       const years = Array.from({ length: currentYear - firstYear + 1 }, (_, i) => firstYear + i);
 
-      // 1) Load years sequentially to stay under OpenF1's rate limit.
+      // 1) Load years in parallel with staggered starts to stay under OpenF1's rate limit.
       //    Meetings + sessions within a year are still parallel (2 requests).
       //    Each failing year is isolated so others still load.
       type YearPayload = {
@@ -193,27 +200,27 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const yearErrors: string[] = [];
       const yearResults: Array<YearPayload | null> = [];
 
-      for (let i = 0; i < years.length; i++) {
-        const year = years[i];
-        setConnectingProgress(`Cargando temporada ${year} (${i + 1}/${years.length})…`);
-        try {
-          const [meetings, sessions] = await Promise.all([
-            loadYearMeetings(year),
-            loadYearSessions(year),
-          ]);
-          const rawDrivers = await loadYearDriversFromSessions(sessions);
-          yearResults.push({ year, meetings, sessions, rawDrivers });
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          console.warn(`OpenF1: could not load ${year} — ${msg}`);
-          yearErrors.push(`${year}: ${msg}`);
-          yearResults.push(null);
-        }
-        // Pause between years to avoid triggering the API rate limit
-        if (i < years.length - 1) {
-          await new Promise(r => setTimeout(r, 1500));
-        }
-      }
+      const yearPromises = years.map((year, i) =>
+        new Promise<void>(async resolve => {
+          await new Promise(r => setTimeout(r, i * 500));
+          setConnectingProgress(`Cargando temporada ${year} (${i + 1}/${years.length})…`);
+          try {
+            const [meetings, sessions] = await Promise.all([
+              loadYearMeetings(year),
+              loadYearSessions(year),
+            ]);
+            const rawDrivers = await loadYearDriversFromSessions(sessions);
+            yearResults[i] = { year, meetings, sessions, rawDrivers };
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            appLog('warn', `OpenF1: could not load ${year} — ${msg}`);
+            yearErrors.push(`${year}: ${msg}`);
+            yearResults[i] = null;
+          }
+          resolve();
+        })
+      );
+      await Promise.all(yearPromises);
 
       const yearPayload = yearResults.filter((p): p is NonNullable<typeof p> => p !== null);
       if (yearPayload.length === 0) {
@@ -250,7 +257,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
             const reason = err instanceof Error ? err.message : String(err);
             const circuitId = normalizeCircuitId(m.circuit_short_name);
             circuitFailures.push({ circuitId, reason });
-            console.warn(`OpenF1: circuit geometry failed for ${circuitId} — ${reason}`);
+            appLog('warn', `OpenF1: circuit geometry failed for ${circuitId} — ${reason}`);
             return null;
           }
         })
@@ -372,7 +379,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setApiStatus('connected');
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      console.error('OpenF1 API connection failed:', msg);
+      appLog('error', 'OpenF1 API connection failed:', msg);
       setApiError(msg);
       setApiStatus('error');
     }
@@ -635,12 +642,12 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
           );
         } else {
           failedByKey.set(key, { key, driver, session, reason: dataset.reason });
-          console.warn(`OpenF1[${attemptLabel}]: ${driver.name} ${session.year} R${session.round} ${session.sessionName} — ${dataset.reason}`);
+          appLog('warn', `OpenF1[${attemptLabel}]: ${driver.name} ${session.year} R${session.round} ${session.sessionName} — ${dataset.reason}`);
         }
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         failedByKey.set(key, { key, driver, session, reason });
-        console.error(`OpenF1[${attemptLabel}]: ${driver.name} ${session.year} R${session.round} ${session.sessionName} — ${reason}`);
+        appLog('error', `OpenF1[${attemptLabel}]: ${driver.name} ${session.year} R${session.round} ${session.sessionName} — ${reason}`);
       }
       return { fromCache: false };
     };
@@ -796,11 +803,11 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
           );
           return { ok: true };
         }
-        console.warn(`OpenF1[${attemptLabel}]: ${driver.name} ${session.year} R${session.round} ${session.sessionName} — ${dataset.reason}`);
+        appLog('warn', `OpenF1[${attemptLabel}]: ${driver.name} ${session.year} R${session.round} ${session.sessionName} — ${dataset.reason}`);
         return { ok: false, reason: dataset.reason };
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        console.error(`OpenF1[${attemptLabel}]: ${driver.name} ${session.year} R${session.round} ${session.sessionName} — ${reason}`);
+        appLog('error', `OpenF1[${attemptLabel}]: ${driver.name} ${session.year} R${session.round} ${session.sessionName} — ${reason}`);
         return { ok: false, reason };
       }
     };

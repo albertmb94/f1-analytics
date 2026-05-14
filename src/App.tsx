@@ -224,6 +224,10 @@ function App() {
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
             onClick={() => setShowSessionPicker(false)}
+            onKeyDown={e => { if (e.key === 'Escape') setShowSessionPicker(false); }}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Selección de sesiones activas"
           >
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}

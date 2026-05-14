@@ -2,14 +2,12 @@ import React, { useState, useMemo } from 'react';
 import { useData } from '../context/DataContext';
 import type { MLInsight } from '../types/f1';
 import {
-  aggregateTeamMetrics,
-  computePaceMaps,
-  computeTeamIdealRanking,
   isModernRegulations,
   type TeamMetrics,
   type TeamIdealEntry
 } from '../lib/teamMetrics';
-import { filterDatasetByActiveSessions } from '../lib/activeDataset';
+import { filterDatasetByActiveSessions, filterDriversByActiveSessions } from '../lib/activeDataset';
+import { useTeamData } from '../hooks/useTeamData';
 import {
   Brain,
   GitCompare,
@@ -221,45 +219,22 @@ const MLAnalysis: React.FC = () => {
   const downloadedData = useMemo(() => ({
     ...downloaded,
     telemetry: filterDatasetByActiveSessions(downloaded.telemetry, activeSessionKeys),
-    laps: filterDatasetByActiveSessions(downloaded.laps, activeSessionKeys)
+    laps: filterDatasetByActiveSessions(downloaded.laps, activeSessionKeys),
+    drivers: filterDriversByActiveSessions(downloaded.drivers, downloaded.laps, activeSessionKeys)
   }), [downloaded, activeSessionKeys]);
-  const resolvedDownloadDrivers = downloaded.drivers;
+  const resolvedDownloadDrivers = downloadedData.drivers;
   const availableTeams = catalogue?.teams
     ? Object.values(catalogue.teams).flat().filter((t, i, arr) => arr.findIndex(x => x.id === t.id) === i)
     : [];
 
-  // Derive real team characteristics, pace and ideal-lap ranking from downloaded telemetry
-  const realTeamData = useMemo(() => {
-    const lapEntries = Object.entries(downloadedData.laps ?? {});
-    const telemetryEntries = downloadedData.telemetry ?? {};
-    if (lapEntries.length === 0) return null;
+  const { characteristics, idealRanking: idealRankingMap } = useTeamData(
+    resolvedDownloadDrivers, downloadedData.laps, downloadedData.telemetry
+  );
 
-    const driversByTeam = new Map<string, Array<{ driverId: string; telemetry: typeof telemetryEntries[string]; laps: typeof lapEntries[number][1] }>>();
-    const driverEntries: Array<{ driverId: string; team: string; laps: typeof lapEntries[number][1] }> = [];
-
-    resolvedDownloadDrivers.forEach(driver => {
-      const lapsForDriver = lapEntries
-        .filter(([key]) => key.startsWith(`${driver.id}_`))
-        .flatMap(([, laps]) => laps);
-      const telemetryForDriver = Object.entries(telemetryEntries)
-        .filter(([key]) => key.startsWith(`${driver.id}_`))
-        .flatMap(([, points]) => points);
-      if (lapsForDriver.length === 0 && telemetryForDriver.length === 0) return;
-      const arr = driversByTeam.get(driver.team) ?? [];
-      arr.push({ driverId: driver.id, telemetry: telemetryForDriver, laps: lapsForDriver });
-      driversByTeam.set(driver.team, arr);
-      driverEntries.push({ driverId: driver.id, team: driver.team, laps: lapsForDriver });
-    });
-
-    if (driversByTeam.size === 0) return null;
-    const aggregateInputs = Array.from(driversByTeam.entries()).map(([team, drivers]) => ({ team, drivers }));
-    const characteristics = aggregateTeamMetrics(aggregateInputs);
-    const { pace } = computePaceMaps(driverEntries);
-    const idealRanking = computeTeamIdealRanking(driverEntries);
-    return { characteristics, pace, idealRanking };
-  }, [downloadedData.laps, downloadedData.telemetry, resolvedDownloadDrivers]);
-
-  const idealRanking: TeamIdealEntry[] = realTeamData?.idealRanking ?? [];
+  const idealRanking: TeamIdealEntry[] = useMemo(() =>
+    [...idealRankingMap.values()].sort((a, b) => a.idealLap - b.idealLap),
+    [idealRankingMap]
+  );
 
   const cleanLapCount = useMemo(() => {
     return Object.values(downloadedData.laps ?? {}).reduce((acc, laps) => acc + laps.filter(l => l.isCleanAir).length, 0);
@@ -289,7 +264,6 @@ const MLAnalysis: React.FC = () => {
     const teamsWithRealData = new Set(idealRanking.map(e => e.team));
     const teamsToUse = availableTeams.filter(t => teamsWithRealData.has(t.name));
     const driversToUse = resolvedDownloadDrivers.length > 0 ? resolvedDownloadDrivers : [];
-    const characteristics = realTeamData?.characteristics ?? new Map();
     return buildInsights({
       teams: teamsToUse,
       drivers: driversToUse,
@@ -298,10 +272,10 @@ const MLAnalysis: React.FC = () => {
       idealRanking,
       year: activeYear
     });
-  }, [availableTeams, resolvedDownloadDrivers, downloadedData, idealRanking, realTeamData, activeYear]);
+  }, [availableTeams, resolvedDownloadDrivers, downloadedData, idealRanking, characteristics, activeYear]);
 
   const teamCharacteristics = (team: import('../types/f1').Team): TeamMetrics => {
-    const real = realTeamData?.characteristics.get(team.name);
+    const real = characteristics.get(team.name);
     if (real) return real;
     const fallback = team.characteristics;
     return {
@@ -473,7 +447,7 @@ const MLAnalysis: React.FC = () => {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {teamsOrderedByIdeal.map((team, idx) => {
               const c = teamCharacteristics(team);
-              const hasReal = realTeamData?.characteristics.has(team.name) ?? false;
+              const hasReal = characteristics.has(team.name);
               return (
                 <div key={team.id} className="bg-gray-800 rounded-xl p-5 border border-gray-700">
                   <div className="flex items-center justify-between mb-4">

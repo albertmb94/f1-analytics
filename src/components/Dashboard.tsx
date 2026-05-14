@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { useData } from '../context/DataContext';
-import { filterDatasetByActiveSessions } from '../lib/activeDataset';
+import { filterDatasetByActiveSessions, filterDriversByActiveSessions } from '../lib/activeDataset';
 import {
   Activity,
   GitCompare,
@@ -35,6 +35,7 @@ const Dashboard: React.FC = () => {
     ...downloaded,
     telemetry: filterDatasetByActiveSessions(downloaded.telemetry, activeSessionKeys),
     laps: filterDatasetByActiveSessions(downloaded.laps, activeSessionKeys),
+    drivers: filterDriversByActiveSessions(downloaded.drivers, downloaded.laps, activeSessionKeys),
     sessions: downloaded.sessions.filter(s => activeSessionKeys.size === 0 || activeSessionKeys.has(`${s.year}_${s.round}_${s.sessionType}`))
   }), [downloaded, activeSessionKeys]);
   const resolvedDownloadDrivers = downloaded.drivers;

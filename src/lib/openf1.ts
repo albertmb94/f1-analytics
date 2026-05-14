@@ -4,6 +4,13 @@ import { CURATED_PROFILES } from './circuitCatalog';
 
 const OPENF1_BASE = 'https://api.openf1.org/v1';
 
+function appLog(level: 'warn' | 'error', message: string, ...args: unknown[]): void {
+  if (process.env.NODE_ENV !== 'production') {
+    if (level === 'warn') console.warn(message, ...args);
+    else console.error(message, ...args);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Raw API types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -330,11 +337,6 @@ export async function loadYearSessions(year: number): Promise<OpenF1Session[]> {
   return (raw as OpenF1Session[]).filter(s => !s.session_name?.toLowerCase().includes('day '));
 }
 
-export async function loadYearDrivers(year: number): Promise<OpenF1Driver[]> {
-  const sessions = await loadYearSessions(year);
-  return loadYearDriversFromSessions(sessions);
-}
-
 // Reuses an already-loaded session list — avoids an extra /sessions round-trip
 export async function loadYearDriversFromSessions(sessions: OpenF1Session[]): Promise<OpenF1Driver[]> {
   const now = new Date();
@@ -352,7 +354,7 @@ export async function loadYearDriversFromSessions(sessions: OpenF1Session[]): Pr
   try {
     return await fetchJson<OpenF1Driver[]>(`${OPENF1_BASE}/drivers?session_key=${referenceSession.session_key}`);
   } catch (err) {
-    console.warn(`OpenF1: drivers roster missing for session ${referenceSession.session_key}`, err);
+    appLog('warn', `OpenF1: drivers roster missing for session ${referenceSession.session_key}`, err);
     return [];
   }
 }

@@ -2,9 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useData } from '../context/DataContext';
 import type { Circuit, Driver, SimulationResult, Team } from '../types/f1';
 import {
-  aggregateTeamMetrics,
   computePaceMaps,
-  computeTeamIdealRanking,
   computeDriverIdealMap,
   computeIdealVariance,
   computeAeroModeShare,
@@ -17,13 +15,13 @@ import {
   quantile,
   calculateTopologyMismatch,
   estimateCircuitBaseTime,
-  type TeamIdealEntry,
   type SessionTypeLite,
   type AeroModeShare,
   type TireCompound,
   type RaceStrategyResult
 } from '../lib/teamMetrics';
-import { filterDatasetByActiveSessions } from '../lib/activeDataset';
+import { filterDatasetByActiveSessions, filterDriversByActiveSessions } from '../lib/activeDataset';
+import { useTeamData } from '../hooks/useTeamData';
 import {
   Calculator,
   Trophy,
@@ -49,6 +47,13 @@ import {
 } from 'recharts';
 import { motion } from 'framer-motion';
 
+function appLog(level: 'warn' | 'error', message: string, ...args: unknown[]): void {
+  if (process.env.NODE_ENV !== 'production') {
+    if (level === 'warn') console.warn(message, ...args);
+    else console.error(message, ...args);
+  }
+}
+
 const PredictiveSimulator: React.FC = () => {
   const { catalogue, selection, downloaded: downloadedRaw, activeSessionKeys } = useData();
   // Honor the global active-sessions filter so the simulator only consumes data the user wants.
@@ -56,6 +61,7 @@ const PredictiveSimulator: React.FC = () => {
     ...downloadedRaw,
     telemetry: filterDatasetByActiveSessions(downloadedRaw.telemetry, activeSessionKeys),
     laps: filterDatasetByActiveSessions(downloadedRaw.laps, activeSessionKeys),
+    drivers: filterDriversByActiveSessions(downloadedRaw.drivers, downloadedRaw.laps, activeSessionKeys),
     sessions: downloadedRaw.sessions.filter(s => activeSessionKeys.size === 0 || activeSessionKeys.has(`${s.year}_${s.round}_${s.sessionType}`))
   }), [downloadedRaw, activeSessionKeys]);
   const availableCircuits = catalogue?.circuits ?? [];
@@ -68,9 +74,14 @@ const PredictiveSimulator: React.FC = () => {
   const [simulationResults, setSimulationResults] = useState<SimulationResult[]>([]);
   const [hasSimulated, setHasSimulated] = useState(false);
 
-  // Aggregate per-driver telemetry+laps from real downloaded data, grouped by team.
-  // Skips drivers with no telemetry at all (failed downloads).
-  const realTeamData = useMemo(() => {
+  const {
+    characteristics,
+    idealRanking,
+    teamLaps,
+  } = useTeamData(downloaded.drivers, downloaded.laps, downloaded.telemetry);
+
+  // Additional derived data not covered by useTeamData
+  const additionalTeamData = useMemo(() => {
     const lapEntries = Object.entries(downloaded.laps ?? {});
     const telemetryEntries = downloaded.telemetry ?? {};
     if (lapEntries.length === 0 && Object.keys(telemetryEntries).length === 0) return null;
@@ -94,50 +105,26 @@ const PredictiveSimulator: React.FC = () => {
 
     if (driversByTeam.size === 0) return null;
 
-    const aggregateInputs = Array.from(driversByTeam.entries()).map(([team, drivers]) => ({
-      team,
-      drivers
-    }));
-    const characteristics = aggregateTeamMetrics(aggregateInputs);
     const { pace, driverPace } = computePaceMaps(driverEntries);
-    const idealList = computeTeamIdealRanking(driverEntries);
-    const idealRanking = new Map<string, TeamIdealEntry>();
-    idealList.forEach(e => idealRanking.set(e.team, e));
     const driverIdeal = computeDriverIdealMap(driverEntries);
 
-    // Per-team aggregated laps for variance estimation
-    const teamLaps = new Map<string, typeof lapEntries[number][1]>();
-    driverEntries.forEach(d => {
-      const arr = teamLaps.get(d.team) ?? [];
-      arr.push(...d.laps);
-      teamLaps.set(d.team, arr);
-    });
-
-    // Per-driver lap count, for weighting driverAdjustment in the simulator
-    // so a 3-lap teammate doesn't carry the same weight as a 25-lap one.
     const driverLapCount = new Map<string, number>();
     driverEntries.forEach(d => {
       driverLapCount.set(d.driverId, d.laps.length);
     });
 
-    // Per-team aero-mode share (X-mode vs Z-mode). Derived from telemetry;
-    // empty teams (no telemetry yet) get zero shares and are simply not
-    // penalised by the mode-fit term.
     const aeroModeShare = new Map<string, AeroModeShare>();
     driversByTeam.forEach((teamDrivers, team) => {
       const merged = teamDrivers.flatMap(d => d.telemetry);
       aeroModeShare.set(team, computeAeroModeShare(merged));
     });
 
-    // Per-team compound degradation slopes (s/lap of tire age, per compound).
-    // Feeds the race-pace strategy forecaster.
     const compoundDegradationByTeam = new Map<string, Map<TireCompound, number>>();
     driversByTeam.forEach((teamDrivers, team) => {
       const allLaps = teamDrivers.flatMap(d => d.laps);
       compoundDegradationByTeam.set(team, computeCompoundDegradation(allLaps));
     });
 
-    // Track which teams have only some of their expected drivers loaded
     const expectedByTeam = new Map<string, number>();
     downloaded.drivers.forEach(d => {
       expectedByTeam.set(d.team, (expectedByTeam.get(d.team) ?? 0) + 1);
@@ -148,18 +135,18 @@ const PredictiveSimulator: React.FC = () => {
       if (loaded.length < expected) partial.set(team, { loaded: loaded.length, expected });
     });
 
-    return { characteristics, pace, driverPace, idealRanking, driverIdeal, teamLaps, driverLapCount, aeroModeShare, compoundDegradationByTeam, partial };
-  }, [downloaded.laps, downloaded.telemetry, downloaded.drivers]);
+    return { pace, driverPace, driverIdeal, driverLapCount, aeroModeShare, compoundDegradationByTeam, partial };
+  }, [downloaded.drivers, downloaded.laps, downloaded.telemetry]);
 
-  const realTeamPace = realTeamData?.pace ?? null;
-  const realCharacteristics = realTeamData?.characteristics ?? null;
-  const realIdealRanking = realTeamData?.idealRanking ?? null;
-  const realDriverIdeal = realTeamData?.driverIdeal ?? null;
-  const realTeamLaps = realTeamData?.teamLaps ?? null;
-  const realDriverLapCount = realTeamData?.driverLapCount ?? null;
-  const realAeroModeShare = realTeamData?.aeroModeShare ?? null;
-  const realCompoundDegradation = realTeamData?.compoundDegradationByTeam ?? null;
-  const partialTeams = realTeamData?.partial ?? null;
+  const realTeamPace = additionalTeamData?.pace ?? null;
+  const realCharacteristics = characteristics.size > 0 ? characteristics : null;
+  const realIdealRanking = idealRanking.size > 0 ? idealRanking : null;
+  const realDriverIdeal = additionalTeamData?.driverIdeal ?? null;
+  const realTeamLaps = teamLaps.size > 0 ? teamLaps : null;
+  const realDriverLapCount = additionalTeamData?.driverLapCount ?? null;
+  const realAeroModeShare = additionalTeamData?.aeroModeShare ?? null;
+  const realCompoundDegradation = additionalTeamData?.compoundDegradationByTeam ?? null;
+  const partialTeams = additionalTeamData?.partial ?? null;
 
   const circuitOptions = useMemo(() => {
     if (selectedData.circuits.length > 0) return selectedData.circuits;
@@ -386,7 +373,7 @@ const PredictiveSimulator: React.FC = () => {
 
     const sumWin = results.reduce((s, r) => s + r.winProbability, 0);
     if (Math.abs(sumWin - 100) > 1) {
-      console.warn(`Monte Carlo: win probabilities sum to ${sumWin.toFixed(2)}% (expected ≈ 100)`);
+      appLog('warn', `Monte Carlo: win probabilities sum to ${sumWin.toFixed(2)}% (expected ≈ 100)`);
     }
     // Sanity check: top-3 of Monte Carlo should match top-3 of ideal-lap ranking
     const idealOrder = Array.from(realIdealRanking.values())
@@ -396,7 +383,7 @@ const PredictiveSimulator: React.FC = () => {
     const mcOrder = results.slice(0, 3).map(r => r.team);
     const matches = mcOrder.filter(t => idealOrder.includes(t)).length;
     if (matches < 2) {
-      console.warn('Monte Carlo top-3 diverges from ideal-lap ranking', { mcOrder, idealOrder });
+      appLog('warn', 'Monte Carlo top-3 diverges from ideal-lap ranking', { mcOrder, idealOrder });
     }
     return results;
   };
@@ -536,8 +523,9 @@ const PredictiveSimulator: React.FC = () => {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {/* Circuit Selection */}
           <div>
-            <label className="block text-gray-400 text-sm mb-2">Circuito</label>
+            <label htmlFor="circuit-select" className="block text-gray-400 text-sm mb-2">Circuito</label>
             <select 
+              id="circuit-select"
               value={selectedCircuit}
               onChange={(e) => {
                 setSelectedCircuit(e.target.value);

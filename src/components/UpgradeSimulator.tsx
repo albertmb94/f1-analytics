@@ -2,14 +2,12 @@ import React, { useMemo, useState } from 'react';
 import { useData } from '../context/DataContext';
 import type { Circuit } from '../types/f1';
 import {
-  aggregateTeamMetrics,
-  computeTeamIdealRanking,
   calculateTopologyMismatch,
   estimateCircuitBaseTime,
-  type TeamMetrics,
-  type TeamIdealEntry
+  type TeamMetrics
 } from '../lib/teamMetrics';
-import { filterDatasetByActiveSessions } from '../lib/activeDataset';
+import { filterDatasetByActiveSessions, filterDriversByActiveSessions } from '../lib/activeDataset';
+import { useTeamData } from '../hooks/useTeamData';
 import {
   Zap,
   Wrench,
@@ -72,6 +70,7 @@ const UpgradeSimulator: React.FC = () => {
     ...downloadedRaw,
     telemetry: filterDatasetByActiveSessions(downloadedRaw.telemetry, activeSessionKeys),
     laps: filterDatasetByActiveSessions(downloadedRaw.laps, activeSessionKeys),
+    drivers: filterDriversByActiveSessions(downloadedRaw.drivers, downloadedRaw.laps, activeSessionKeys),
     sessions: downloadedRaw.sessions.filter(s => activeSessionKeys.size === 0 || activeSessionKeys.has(`${s.year}_${s.round}_${s.sessionType}`))
   }), [downloadedRaw, activeSessionKeys]);
 
@@ -80,44 +79,11 @@ const UpgradeSimulator: React.FC = () => {
     Object.fromEntries(UPGRADE_PARTS.map(p => [p.id, 0]))
   );
 
-  const teamData = useMemo(() => {
-    const lapEntries = Object.entries(downloaded.laps ?? {});
-    const telemetryEntries = downloaded.telemetry ?? {};
-    if (lapEntries.length === 0 && Object.keys(telemetryEntries).length === 0) return null;
-
-    const driversByTeam = new Map<string, Array<{ driverId: string; laps: typeof lapEntries[number][1] }>>();
-    const driverEntries: Array<{ driverId: string; team: string; laps: typeof lapEntries[number][1] }> = [];
-
-    downloaded.drivers.forEach(driver => {
-      const lapsForDriver = lapEntries
-        .filter(([key]) => key.startsWith(`${driver.id}_`))
-        .flatMap(([, laps]) => laps);
-      const telemetryForDriver = Object.entries(telemetryEntries)
-        .filter(([key]) => key.startsWith(`${driver.id}_`))
-        .flatMap(([, points]) => points);
-      if (lapsForDriver.length === 0 && telemetryForDriver.length === 0) return;
-      const arr = driversByTeam.get(driver.team) ?? [];
-      arr.push({ driverId: driver.id, laps: lapsForDriver });
-      driversByTeam.set(driver.team, arr);
-      driverEntries.push({ driverId: driver.id, team: driver.team, laps: lapsForDriver });
-    });
-
-    if (driversByTeam.size === 0) return null;
-
-    const aggregateInputs = Array.from(driversByTeam.entries()).map(([team, drivers]) => ({
-      team, drivers: drivers.map(d => ({ ...d, telemetry: telemetryEntries[`${d.driverId}_`] ?? [] }))
-    }));
-    const characteristics = aggregateTeamMetrics(aggregateInputs);
-    const idealList = computeTeamIdealRanking(driverEntries);
-    const idealRanking = new Map<string, TeamIdealEntry>();
-    idealList.forEach(e => idealRanking.set(e.team, e));
-
-    return { characteristics, idealRanking, teams: [...driversByTeam.keys()] };
-  }, [downloaded.laps, downloaded.telemetry, downloaded.drivers]);
-
-  const teamOptions = teamData?.teams ?? [];
-  const selectedTeamChars = selectedTeam ? teamData?.characteristics.get(selectedTeam) : undefined;
-  const selectedTeamIdeal = selectedTeam ? teamData?.idealRanking.get(selectedTeam)?.idealLap : undefined;
+  const { characteristics, idealRanking, teamKeys: teamOptions } = useTeamData(
+    downloaded.drivers, downloaded.laps, downloaded.telemetry
+  );
+  const selectedTeamChars = selectedTeam ? characteristics.get(selectedTeam) : undefined;
+  const selectedTeamIdeal = selectedTeam ? idealRanking.get(selectedTeam)?.idealLap : undefined;
 
   const baseChars = useMemo((): TeamMetrics => selectedTeam && selectedTeamChars ? selectedTeamChars : { downforce: 50, drag: 50, traction: 50, tireManagement: 50, braking: 50 }, [selectedTeamChars, selectedTeam]);
 
@@ -170,10 +136,10 @@ const UpgradeSimulator: React.FC = () => {
   }, [selectedTeam, baseChars, modifiedChars, circuits]);
 
   const raceForecast = useMemo(() => {
-    if (!selectedTeam || !teamData || circuits.length === 0) return [];
+    if (!selectedTeam || circuits.length === 0) return [];
     const entries: Array<{ team: string; before: number; after: number }> = [];
-    teamData.idealRanking.forEach((entry, team) => {
-      const chars = teamData.characteristics.get(team) ?? baseChars;
+    idealRanking.forEach((entry, team) => {
+      const chars = characteristics.get(team) ?? baseChars;
       const before = entry.idealLap;
       const after = team === selectedTeam
         ? estimateCircuitBaseTime((circuits[0] as Circuit).profile, (circuits[0] as Circuit).length) + calculateTopologyMismatch(modifiedChars, circuits[0] as Circuit, 'R') + (entry.idealLap - estimateCircuitBaseTime((circuits[0] as Circuit).profile, (circuits[0] as Circuit).length) - calculateTopologyMismatch(chars, circuits[0] as Circuit, 'Q'))
@@ -190,7 +156,7 @@ const UpgradeSimulator: React.FC = () => {
       delta: e.after - e.before,
       isUpgraded: e.team === selectedTeam,
     }));
-  }, [selectedTeam, teamData, baseChars, modifiedChars, circuits]);
+  }, [selectedTeam, idealRanking, characteristics, baseChars, modifiedChars, circuits]);
 
   const setPreset = (name: string) => {
     const preset = QUICK_SETUPS[name];

@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { useData } from '../context/DataContext';
 import type { TelemetryPoint, Lap } from '../types/f1';
-import { filterDatasetByActiveSessions } from '../lib/activeDataset';
+import { filterDatasetByActiveSessions, filterDriversByActiveSessions } from '../lib/activeDataset';
 import { Table, Download, Search, AlertCircle, ChevronDown, ChevronRight, Activity, Timer } from 'lucide-react';
 
 const RawData: React.FC = () => {
@@ -10,6 +10,7 @@ const RawData: React.FC = () => {
     ...downloadedRaw,
     telemetry: filterDatasetByActiveSessions(downloadedRaw.telemetry, activeSessionKeys),
     laps: filterDatasetByActiveSessions(downloadedRaw.laps, activeSessionKeys),
+    drivers: filterDriversByActiveSessions(downloadedRaw.drivers, downloadedRaw.laps, activeSessionKeys),
     sessions: downloadedRaw.sessions.filter(s => activeSessionKeys.size === 0 || activeSessionKeys.has(`${s.year}_${s.round}_${s.sessionType}`))
   }), [downloadedRaw, activeSessionKeys]);
   const [activeView, setActiveView] = useState<'telemetry' | 'laps'>('laps');

@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { useData } from '../context/DataContext';
 import { linearSlope } from '../lib/teamMetrics';
-import { filterDatasetByActiveSessions } from '../lib/activeDataset';
+import { filterDatasetByActiveSessions, filterDriversByActiveSessions } from '../lib/activeDataset';
 import {
   Activity,
   Fuel,
@@ -33,6 +33,7 @@ const TelemetryProcessing: React.FC = () => {
     ...downloaded,
     telemetry: filterDatasetByActiveSessions(downloaded.telemetry, activeSessionKeys),
     laps: filterDatasetByActiveSessions(downloaded.laps, activeSessionKeys),
+    drivers: filterDriversByActiveSessions(downloaded.drivers, downloaded.laps, activeSessionKeys),
     sessions: downloaded.sessions.filter(s => activeSessionKeys.size === 0 || activeSessionKeys.has(`${s.year}_${s.round}_${s.sessionType}`))
   }), [downloaded, activeSessionKeys]);
   const resolvedDownloadDrivers = downloaded.drivers;
@@ -86,7 +87,7 @@ const TelemetryProcessing: React.FC = () => {
   const fuelCorrectedLaps = useMemo(() => {
     return laps.map(lap => ({
       ...lap,
-      fuelCorrection: (laps.length - lap.number) * 0.035
+      fuelCorrection: (laps.length - lap.number) * 0.035 * 2.5 / 10
     }));
   }, [laps]);
 
@@ -213,6 +214,7 @@ const TelemetryProcessing: React.FC = () => {
         <div className="flex gap-3 flex-wrap">
           {/* Driver selector */}
           <select
+            aria-label="Seleccionar piloto"
             value={driver?.id || ''}
             onChange={e => setSelectedDriverId(e.target.value)}
             className="bg-gray-800 border border-gray-700 text-white px-3 py-2 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-red-500"
@@ -224,6 +226,7 @@ const TelemetryProcessing: React.FC = () => {
           {/* Session selector */}
           {activeSessions.length > 0 && (
             <select
+              aria-label="Seleccionar sesión"
               value={session ? `${session.year}_${session.round}_${session.sessionType}` : ''}
               onChange={e => setSelectedSessionKey(e.target.value)}
               className="bg-gray-800 border border-gray-700 text-white px-3 py-2 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-red-500"

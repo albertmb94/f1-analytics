@@ -2,7 +2,8 @@ import React, { useState, useMemo } from 'react';
 import { useData } from '../context/DataContext';
 import type { Circuit } from '../types/f1';
 import { computeTireManagement, isCleanLap, aggregateTeamMetrics, type TeamMetrics } from '../lib/teamMetrics';
-import { filterDatasetByActiveSessions } from '../lib/activeDataset';
+import { filterDatasetByActiveSessions, filterDriversByActiveSessions } from '../lib/activeDataset';
+import { useTeamData } from '../hooks/useTeamData';
 import { 
   MapPin, 
   Wind, 
@@ -37,6 +38,7 @@ const CircuitMapping: React.FC = () => {
     ...downloadedRaw,
     telemetry: filterDatasetByActiveSessions(downloadedRaw.telemetry, activeSessionKeys),
     laps: filterDatasetByActiveSessions(downloadedRaw.laps, activeSessionKeys),
+    drivers: filterDriversByActiveSessions(downloadedRaw.drivers, downloadedRaw.laps, activeSessionKeys),
     sessions: downloadedRaw.sessions.filter(s => activeSessionKeys.size === 0 || activeSessionKeys.has(`${s.year}_${s.round}_${s.sessionType}`))
   }), [downloadedRaw, activeSessionKeys]);
   const availableCircuits = (catalogue?.circuits ?? []).filter(c =>
@@ -48,58 +50,52 @@ const CircuitMapping: React.FC = () => {
   const [compareTeam, setCompareTeam] = useState<string>('');
   const [compareDriver, setCompareDriver] = useState<string>('');
 
-  // Build team metrics from downloaded telemetry for the comparison silhouette.
-  // We always aggregate the full set of downloaded teams (for stable normalization),
-  // then pick the team or driver requested.
+  const { characteristics, teamKeys } = useTeamData(
+    downloaded.drivers, downloaded.laps, downloaded.telemetry
+  );
+
+  // Build team metrics for the comparison silhouette from the shared hook.
+  // When a specific driver is picked, recompute using just that driver as if
+  // they were a one-man "team" but normalize within the existing set so the
+  // scale stays comparable.
   const carComparison = useMemo(() => {
-    const drivers = downloaded.drivers;
-    if (drivers.length === 0) return { teamMetrics: null as TeamMetrics | null, available: false };
+    if (teamKeys.length === 0) return { teamMetrics: null as TeamMetrics | null, available: false };
 
-    const driversByTeam = new Map<string, Array<{ driverId: string; telemetry: typeof downloaded.telemetry[string]; laps: typeof downloaded.laps[string] }>>();
-    drivers.forEach(driver => {
-      const lapsForDriver = Object.entries(downloaded.laps)
-        .filter(([key]) => key.startsWith(`${driver.id}_`))
-        .flatMap(([, l]) => l);
-      const telForDriver = Object.entries(downloaded.telemetry)
-        .filter(([key]) => key.startsWith(`${driver.id}_`))
-        .flatMap(([, t]) => t);
-      if (lapsForDriver.length === 0 && telForDriver.length === 0) return;
-      const arr = driversByTeam.get(driver.team) ?? [];
-      arr.push({ driverId: driver.id, telemetry: telForDriver, laps: lapsForDriver });
-      driversByTeam.set(driver.team, arr);
-    });
+    if (!compareEnabled || !compareTeam) return { teamMetrics: null, available: true };
 
-    if (driversByTeam.size === 0) return { teamMetrics: null, available: false };
-
-    const teamInputs = Array.from(driversByTeam.entries()).map(([team, ds]) => ({ team, drivers: ds }));
-    const allTeamMetrics = aggregateTeamMetrics(teamInputs);
-
-    if (!compareEnabled || !compareTeam) return { teamMetrics: null, available: driversByTeam.size > 0 };
-
-    // If a specific driver is picked, recompute using just that driver as if they were a one-man "team"
-    // but normalize within the existing set so the scale stays comparable.
     if (compareDriver) {
+      const lapEntries = Object.entries(downloaded.laps ?? {});
+      const telemetryEntries = downloaded.telemetry ?? {};
+      const drivers = downloaded.drivers;
+
+      const overrideByTeam = new Map<string, Array<{ driverId: string; telemetry: typeof telemetryEntries[string]; laps: typeof lapEntries[number][1] }>>();
+      drivers.forEach(driver => {
+        const lapsForDriver = Object.entries(downloaded.laps ?? {})
+          .filter(([key]) => key.startsWith(`${driver.id}_`))
+          .flatMap(([, l]) => l);
+        const telForDriver = Object.entries(downloaded.telemetry ?? {})
+          .filter(([key]) => key.startsWith(`${driver.id}_`))
+          .flatMap(([, t]) => t);
+        if (lapsForDriver.length === 0 && telForDriver.length === 0) return;
+        const arr = overrideByTeam.get(driver.team) ?? [];
+        arr.push({ driverId: driver.id, telemetry: telForDriver, laps: lapsForDriver });
+        overrideByTeam.set(driver.team, arr);
+      });
+
+      const overrideInputs = Array.from(overrideByTeam.entries()).map(([team, ds]) => ({ team, drivers: ds }));
       const driver = drivers.find(d => d.id === compareDriver);
-      if (!driver) return { teamMetrics: allTeamMetrics.get(compareTeam) ?? null, available: true };
-      const justThisDriver = (driversByTeam.get(driver.team) ?? []).filter(d => d.driverId === compareDriver);
-      if (justThisDriver.length === 0) return { teamMetrics: allTeamMetrics.get(compareTeam) ?? null, available: true };
-      const inputsWithDriverOverride = teamInputs.map(t => t.team === driver.team ? { ...t, drivers: justThisDriver } : t);
+      if (!driver) return { teamMetrics: characteristics.get(compareTeam) ?? null, available: true };
+      const justThisDriver = (overrideByTeam.get(driver.team) ?? []).filter(d => d.driverId === compareDriver);
+      if (justThisDriver.length === 0) return { teamMetrics: characteristics.get(compareTeam) ?? null, available: true };
+      const inputsWithDriverOverride = overrideInputs.map(t => t.team === driver.team ? { ...t, drivers: justThisDriver } : t);
       const overrideMetrics = aggregateTeamMetrics(inputsWithDriverOverride);
       return { teamMetrics: overrideMetrics.get(driver.team) ?? null, available: true };
     }
 
-    return { teamMetrics: allTeamMetrics.get(compareTeam) ?? null, available: true };
-  }, [downloaded, compareEnabled, compareTeam, compareDriver]);
+    return { teamMetrics: characteristics.get(compareTeam) ?? null, available: true };
+  }, [characteristics, teamKeys, compareEnabled, compareTeam, compareDriver, downloaded]);
 
-  const teamsWithData = useMemo(() => {
-    const set = new Set<string>();
-    downloaded.drivers.forEach(d => {
-      const hasLaps = Object.keys(downloaded.laps).some(k => k.startsWith(`${d.id}_`));
-      const hasTel = Object.keys(downloaded.telemetry).some(k => k.startsWith(`${d.id}_`));
-      if (hasLaps || hasTel) set.add(d.team);
-    });
-    return Array.from(set).sort();
-  }, [downloaded]);
+  const teamsWithData = teamKeys;
 
   const driversInSelectedTeam = useMemo(() => {
     if (!compareTeam) return [];
@@ -241,7 +237,8 @@ const CircuitMapping: React.FC = () => {
             Ingesta geométrica desde FastF1 + clasificación dinámica de curvas
           </p>
         </div>
-        <select 
+        <select
+          aria-label="Seleccionar circuito"
           value={selectedCircuit.id}
           onChange={(e) => setSelectedCircuit(availableCircuits.find(c => c.id === e.target.value) || availableCircuits[0])}
           className="bg-gray-800 border border-gray-700 text-white px-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500"
@@ -313,6 +310,7 @@ const CircuitMapping: React.FC = () => {
                 Comparar coche vs circuito
               </button>
               <select
+                aria-label="Seleccionar equipo para comparar"
                 value={compareTeam}
                 onChange={e => { setCompareTeam(e.target.value); setCompareDriver(''); }}
                 disabled={!compareEnabled || !carComparison.available}
@@ -322,6 +320,7 @@ const CircuitMapping: React.FC = () => {
                 {teamsWithData.map(t => <option key={t} value={t}>{t}</option>)}
               </select>
               <select
+                aria-label="Seleccionar piloto para comparar"
                 value={compareDriver}
                 onChange={e => setCompareDriver(e.target.value)}
                 disabled={!compareEnabled || !compareTeam || !carComparison.available}
